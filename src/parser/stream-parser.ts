@@ -14,6 +14,8 @@ export class ToolCallStreamParser {
   private mode: "TEXT" | "BUFFERING_TOOL" = "TEXT";
   private buffer = "";
   private toolCallIndex = 0;
+  private hasSeenToolCall = false;
+  private seenToolSignatures = new Set<string>();
 
   private accumulatedContent = "";
   private accumulatedToolCalls: OpenAIToolCall[] = [];
@@ -34,11 +36,14 @@ export class ToolCallStreamParser {
         const openIdx = this.buffer.indexOf(OPEN_TAG_PREFIX);
 
         if (openIdx !== -1) {
-          // Emit any normal text strictly before `<tool_call`
+          // Emit normal text strictly before the FIRST `<tool_call`;
+          // once a tool call has started in this turn, discard any inter-tool or post-tool chatter.
           if (openIdx > 0) {
-            const normalText = this.buffer.slice(0, openIdx);
-            this.accumulatedContent += normalText;
-            onContentDelta(normalText);
+            if (!this.hasSeenToolCall) {
+              const normalText = this.buffer.slice(0, openIdx);
+              this.accumulatedContent += normalText;
+              onContentDelta(normalText);
+            }
             this.buffer = this.buffer.slice(openIdx);
           }
 
@@ -52,6 +57,7 @@ export class ToolCallStreamParser {
           // Advance past `<tool_call...>` and switch to BUFFERING_TOOL mode
           this.buffer = this.buffer.slice(tagEndIdx + 1);
           this.mode = "BUFFERING_TOOL";
+          this.hasSeenToolCall = true;
           continue;
         }
 
@@ -60,9 +66,11 @@ export class ToolCallStreamParser {
         const safeEmitLen = this.buffer.length - holdbackLen;
 
         if (safeEmitLen > 0) {
-          const safeText = this.buffer.slice(0, safeEmitLen);
-          this.accumulatedContent += safeText;
-          onContentDelta(safeText);
+          if (!this.hasSeenToolCall) {
+            const safeText = this.buffer.slice(0, safeEmitLen);
+            this.accumulatedContent += safeText;
+            onContentDelta(safeText);
+          }
           this.buffer = this.buffer.slice(safeEmitLen);
         }
         break;
@@ -81,8 +89,8 @@ export class ToolCallStreamParser {
         const parsed = this.parseToolJson(rawInner);
         if (parsed) {
           this.emitParsedToolCall(parsed, onToolCallDelta);
-        } else {
-          // If completely unparseable, fall back to emitting raw text so nothing is silently lost
+        } else if (!this.hasSeenToolCall) {
+          // If completely unparseable and no valid tool call was seen, fall back to emitting raw text
           const fallback = `<tool_call>${rawInner}</tool_call>`;
           this.accumulatedContent += fallback;
           onContentDelta(fallback);
@@ -114,15 +122,17 @@ export class ToolCallStreamParser {
   ): "tool_calls" | "stop" {
     if (this.buffer.length > 0) {
       if (this.mode === "TEXT") {
-        this.accumulatedContent += this.buffer;
-        onContentDelta(this.buffer);
+        if (!this.hasSeenToolCall) {
+          this.accumulatedContent += this.buffer;
+          onContentDelta(this.buffer);
+        }
         this.buffer = "";
       } else if (this.mode === "BUFFERING_TOOL") {
         // Attempt salvage if model stopped before closing `</tool_call>`
         const salvaged = this.parseToolJson(this.buffer.trim());
         if (salvaged) {
           this.emitParsedToolCall(salvaged, onToolCallDelta);
-        } else {
+        } else if (this.accumulatedToolCalls.length === 0) {
           const fallback = `<tool_call>${this.buffer}`;
           this.accumulatedContent += fallback;
           onContentDelta(fallback);
@@ -158,6 +168,13 @@ export class ToolCallStreamParser {
     parsed: ParsedToolPayload,
     onToolCallDelta: (toolDelta: OpenAIToolCallDelta) => void
   ): void {
+    const signature = `${parsed.name}::${parsed.arguments}`;
+    if (this.seenToolSignatures.has(signature)) {
+      // Deduplicate identical tool calls within the same turn (prevents self-correction retry loops)
+      return;
+    }
+    this.seenToolSignatures.add(signature);
+
     const index = this.toolCallIndex++;
     const id = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 

@@ -40,7 +40,7 @@ CRITICAL RUNTIME RULES:
     );
 
     let choiceInstruction =
-      "4. When you need to call one or more external tools from <available_tools>, you MUST emit raw XML <tool_call> block(s) in your text response using THIS EXACT FORMAT (valid JSON inside <tool_call></tool_call>, NO markdown code fences inside the tag):\n<tool_call>\n{\"name\": \"exact_tool_name\", \"arguments\": {\"key\": \"value\"}}\n</tool_call>\n5. If calling multiple tools in parallel, output multiple <tool_call>...</tool_call> blocks back-to-back.\n6. Immediately after outputting <tool_call>...</tool_call>, STOP generating further text and wait for the user's <tool_response>.";
+      "4. When you need to call one or more external tools from <available_tools>, you MUST emit raw XML <tool_call> block(s) in your text response using THIS EXACT FORMAT (valid JSON inside <tool_call></tool_call>, NO markdown code fences inside the tag):\n<tool_call>\n{\"name\": \"exact_tool_name\", \"arguments\": {\"key\": \"value\"}}\n</tool_call>\n5. If calling multiple distinct tools in parallel, output multiple <tool_call>...</tool_call> blocks back-to-back.\n6. After outputting <tool_call>...</tool_call>, end your response and wait for <tool_response>. NEVER output meta-commentary about stopping or waiting, NEVER critique or apologize for your own formatting or trailing characters, and NEVER repeat the same <tool_call> block more than once in a turn.";
 
     if (toolChoice === "required") {
       choiceInstruction +=
@@ -80,7 +80,16 @@ function serializeSingleMessage(msg: OpenAIMessage): string {
 
   if (msg.role === "assistant") {
     const parts: string[] = [];
-    if (text) parts.push(text);
+    if (text) {
+      // Strip any historical post-tool_call self-correction hallucinations from polluted transcripts
+      const cleanedText =
+        msg.tool_calls && msg.tool_calls.length > 0
+          ? text
+              .replace(/^\s*(?:_\]|\]<\/tool_call>|<\/tool_call>|\]{2,}>\s*\u03f5?).*$/gms, "")
+              .trim()
+          : text;
+      if (cleanedText) parts.push(cleanedText);
+    }
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
         let parsedArgs: unknown = {};
