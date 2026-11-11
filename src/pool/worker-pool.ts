@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { config, onConfigChange } from "../config.js";
+import { stripModelThinkingSuffix } from "../compiler/model-resolver.js";
 import { SessionAffinityRegistry } from "../compiler/session-hash.js";
 import { AcpModelInfo } from "../types/acp.js";
 import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
@@ -153,7 +154,7 @@ export class WorkerPool {
     }
 
     if (worker.availableModels.length > 0) {
-      this.cachedModels = worker.availableModels;
+      this.cachedModels = this.mergeWithFallbackModels(worker.availableModels);
     }
 
     while (this.waitQueue.length > 0) {
@@ -171,6 +172,20 @@ export class WorkerPool {
 
   public getAvailableModels(): AcpModelInfo[] {
     return this.cachedModels;
+  }
+
+  private mergeWithFallbackModels(liveModels: AcpModelInfo[]): AcpModelInfo[] {
+    const liveBaseIds = new Set(
+      liveModels.map((m) => stripModelThinkingSuffix(m.modelId).toLowerCase())
+    );
+    const merged = [...liveModels];
+    for (const fb of DEFAULT_FALLBACK_MODELS) {
+      const fbBase = stripModelThinkingSuffix(fb.modelId).toLowerCase();
+      if (!liveBaseIds.has(fbBase)) {
+        merged.push(fb);
+      }
+    }
+    return merged;
   }
 
   public getStats() {

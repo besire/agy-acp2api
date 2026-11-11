@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { stripModelThinkingSuffix } from "../compiler/model-resolver.js";
 import { ThinkingLevel } from "../config.js";
 
 export interface RequestTelemetryRecord {
@@ -139,6 +140,7 @@ export class TelemetryStore {
     acpModelId: string,
     thinkingLevel: ThinkingLevel
   ): void {
+    const cleanBase = stripModelThinkingSuffix(baseModelId);
     const now = Date.now();
     const stmt = this.db.prepare(`
       INSERT OR IGNORE INTO sessions (
@@ -152,10 +154,10 @@ export class TelemetryStore {
     stmt.run(
       sessionId,
       workerId,
-      baseModelId,
+      cleanBase,
       acpModelId,
       thinkingLevel,
-      baseModelId,
+      cleanBase,
       now,
       now
     );
@@ -189,8 +191,15 @@ export class TelemetryStore {
         ? Number(((rec.cachedReadTokens / reqTotalPrompt) * 100).toFixed(1))
         : 0;
 
+    const cleanResolvedBase = stripModelThinkingSuffix(rec.resolvedBaseModel);
+    const cleanActualVersion = stripModelThinkingSuffix(
+      rec.actualModelVersion || cleanResolvedBase
+    );
+
     const fullRec: RequestTelemetryRecord = {
       ...rec,
+      resolvedBaseModel: cleanResolvedBase,
+      actualModelVersion: cleanActualVersion,
       cacheHitRate,
     };
 
@@ -198,7 +207,7 @@ export class TelemetryStore {
     this.registerNewSession(
       rec.sessionId,
       rec.workerId,
-      rec.resolvedBaseModel,
+      cleanResolvedBase,
       rec.acpModelId,
       rec.thinkingLevel
     );
@@ -291,7 +300,7 @@ export class TelemetryStore {
         rec.timestamp,
         rec.acpModelId,
         rec.thinkingLevel,
-        rec.actualModelVersion || rec.resolvedBaseModel,
+        cleanActualVersion,
         turns,
         hashHits,
         inputTokens,
@@ -367,28 +376,34 @@ export class TelemetryStore {
       )
       .all() as Array<Record<string, any>>;
 
-    const sessions: SessionTelemetryRecord[] = rawSessions.map((row) => ({
-      sessionId: String(row.session_id),
-      workerId: String(row.worker_id),
-      baseModelId: String(row.base_model_id),
-      lastAcpModelId: String(row.last_acp_model_id),
-      lastThinkingLevel: row.last_thinking_level as ThinkingLevel,
-      lastActualModelVersion: String(row.last_actual_model_version),
-      createdAt: Number(row.created_at),
-      lastActiveAt: Number(row.last_active_at),
-      status: row.status as "ACTIVE" | "CLOSED",
-      turns: Number(row.turns),
-      hashHits: Number(row.hash_hits),
-      inputTokens: Number(row.input_tokens),
-      cachedReadTokens: Number(row.cached_read_tokens),
-      cachedWriteTokens: Number(row.cached_write_tokens),
-      outputTokens: Number(row.output_tokens),
-      thoughtTokens: Number(row.thought_tokens),
-      totalTokens: Number(row.total_tokens),
-      cacheHitRate: Number(row.cache_hit_rate),
-      avgTtftMs: Number(row.avg_ttft_ms),
-      totalTtftMs: Number(row.total_ttft_ms),
-    }));
+    const sessions: SessionTelemetryRecord[] = rawSessions.map((row) => {
+      const cleanBase = stripModelThinkingSuffix(String(row.base_model_id));
+      const cleanLastActual = stripModelThinkingSuffix(
+        String(row.last_actual_model_version || cleanBase)
+      );
+      return {
+        sessionId: String(row.session_id),
+        workerId: String(row.worker_id),
+        baseModelId: cleanBase,
+        lastAcpModelId: String(row.last_acp_model_id),
+        lastThinkingLevel: row.last_thinking_level as ThinkingLevel,
+        lastActualModelVersion: cleanLastActual,
+        createdAt: Number(row.created_at),
+        lastActiveAt: Number(row.last_active_at),
+        status: row.status as "ACTIVE" | "CLOSED",
+        turns: Number(row.turns),
+        hashHits: Number(row.hash_hits),
+        inputTokens: Number(row.input_tokens),
+        cachedReadTokens: Number(row.cached_read_tokens),
+        cachedWriteTokens: Number(row.cached_write_tokens),
+        outputTokens: Number(row.output_tokens),
+        thoughtTokens: Number(row.thought_tokens),
+        totalTokens: Number(row.total_tokens),
+        cacheHitRate: Number(row.cache_hit_rate),
+        avgTtftMs: Number(row.avg_ttft_ms),
+        totalTtftMs: Number(row.total_ttft_ms),
+      };
+    });
 
     const rawRequests = this.db
       .prepare(
@@ -400,32 +415,40 @@ export class TelemetryStore {
       )
       .all() as Array<Record<string, any>>;
 
-    const recentRequests: RequestTelemetryRecord[] = rawRequests.map((row) => ({
-      requestId: String(row.request_id),
-      timestamp: Number(row.timestamp),
-      sessionId: String(row.session_id),
-      workerId: String(row.worker_id),
-      sessionCache: row.session_cache as "HIT" | "MISS",
-      requestedModel: String(row.requested_model),
-      resolvedBaseModel: String(row.resolved_base_model),
-      thinkingLevel: row.thinking_level as ThinkingLevel,
-      acpModelId: String(row.acp_model_id),
-      actualModelVersion: String(row.actual_model_version),
-      ttftMs: Number(row.ttft_ms),
-      durationMs: Number(row.duration_ms),
-      stream: Boolean(row.stream),
-      finishReason: String(row.finish_reason),
-      toolCallsCount: Number(row.tool_calls_count),
-      inputTokens: Number(row.input_tokens),
-      cachedReadTokens: Number(row.cached_read_tokens),
-      cachedWriteTokens: Number(row.cached_write_tokens),
-      outputTokens: Number(row.output_tokens),
-      thoughtTokens: Number(row.thought_tokens),
-      totalTokens: Number(row.total_tokens),
-      cacheHitRate: Number(row.cache_hit_rate),
-      status: row.status as "success" | "error",
-      ...(row.error_message ? { errorMessage: String(row.error_message) } : {}),
-    }));
+    const recentRequests: RequestTelemetryRecord[] = rawRequests.map((row) => {
+      const cleanBase = stripModelThinkingSuffix(
+        String(row.resolved_base_model)
+      );
+      const cleanActual = stripModelThinkingSuffix(
+        String(row.actual_model_version || cleanBase)
+      );
+      return {
+        requestId: String(row.request_id),
+        timestamp: Number(row.timestamp),
+        sessionId: String(row.session_id),
+        workerId: String(row.worker_id),
+        sessionCache: row.session_cache as "HIT" | "MISS",
+        requestedModel: String(row.requested_model),
+        resolvedBaseModel: cleanBase,
+        thinkingLevel: row.thinking_level as ThinkingLevel,
+        acpModelId: String(row.acp_model_id),
+        actualModelVersion: cleanActual,
+        ttftMs: Number(row.ttft_ms),
+        durationMs: Number(row.duration_ms),
+        stream: Boolean(row.stream),
+        finishReason: String(row.finish_reason),
+        toolCallsCount: Number(row.tool_calls_count),
+        inputTokens: Number(row.input_tokens),
+        cachedReadTokens: Number(row.cached_read_tokens),
+        cachedWriteTokens: Number(row.cached_write_tokens),
+        outputTokens: Number(row.output_tokens),
+        thoughtTokens: Number(row.thought_tokens),
+        totalTokens: Number(row.total_tokens),
+        cacheHitRate: Number(row.cache_hit_rate),
+        status: row.status as "success" | "error",
+        ...(row.error_message ? { errorMessage: String(row.error_message) } : {}),
+      };
+    });
 
     return {
       summary: {

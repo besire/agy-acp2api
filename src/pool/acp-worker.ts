@@ -1,5 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import readline from "node:readline";
+import { stripModelThinkingSuffix } from "../compiler/model-resolver.js";
 import { config } from "../config.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
@@ -69,8 +70,9 @@ export class AcpWorker {
 
   public async start(): Promise<void> {
     const snifferPort = await this.sniffer.start((detectedVer) => {
+      const cleanVer = stripModelThinkingSuffix(detectedVer);
       for (const listener of this.activeStreamListeners.values()) {
-        listener.onActualModelDetected?.(detectedVer);
+        listener.onActualModelDetected?.(cleanVer);
       }
     });
 
@@ -300,14 +302,14 @@ export class AcpWorker {
     const confirmed = this.sessionConfirmedConfig.get(sessionId);
 
     if (upstreamModel && upstreamModel !== "gemini-3.5-flash-lite") {
-      return upstreamModel;
+      return stripModelThinkingSuffix(upstreamModel);
     }
 
     if (confirmed?.model) {
-      return confirmed.model;
+      return stripModelThinkingSuffix(confirmed.model);
     }
 
-    return upstreamModel || fallbackAcpModelId;
+    return stripModelThinkingSuffix(upstreamModel || fallbackAcpModelId);
   }
 
   public async closeSession(sessionId: string): Promise<void> {

@@ -5,6 +5,7 @@ import { config, updateGatewayConfig } from "../config.js";
 import {
   buildUnifiedModelCatalog,
   resolveModelAndThinking,
+  stripModelThinkingSuffix,
 } from "../compiler/model-resolver.js";
 import {
   compileDeltaPrompt,
@@ -362,7 +363,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
           abortController.abort();
         });
 
-        let currentRespondingModel = baseModelId;
+        let currentRespondingModel = stripModelThinkingSuffix(baseModelId);
 
         const makeChunk = (
           delta: OpenAIChatCompletionChunk["choices"][0]["delta"],
@@ -396,7 +397,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             acpModelId,
             {
               onActualModelDetected: (detectedVer) => {
-                currentRespondingModel = detectedVer;
+                currentRespondingModel = stripModelThinkingSuffix(detectedVer);
               },
               onThoughtChunk: (thoughtText) => {
                 sendChunk(makeChunk({ reasoning_content: thoughtText }));
@@ -427,7 +428,9 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             abortController.signal
           );
 
-          currentRespondingModel = promptRes.actualModelVersion || currentRespondingModel;
+          currentRespondingModel = stripModelThinkingSuffix(
+            promptRes.actualModelVersion || currentRespondingModel
+          );
 
           const finishReason = parser.flush(
             (contentDelta) => {
@@ -458,10 +461,12 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             workerId: lease.worker.id,
             sessionCache: lease.isReusedSession ? "HIT" : "MISS",
             requestedModel,
-            resolvedBaseModel: baseModelId,
+            resolvedBaseModel: stripModelThinkingSuffix(baseModelId),
             thinkingLevel,
             acpModelId,
-            actualModelVersion: promptRes.actualModelVersion,
+            actualModelVersion: stripModelThinkingSuffix(
+              promptRes.actualModelVersion || baseModelId
+            ),
             ttftMs: promptRes.ttftMs,
             durationMs: promptRes.durationMs,
             stream: true,
@@ -483,10 +488,10 @@ export function createGatewayApp(pool: WorkerPool): Hono {
             workerId: lease.worker.id,
             sessionCache: lease.isReusedSession ? "HIT" : "MISS",
             requestedModel,
-            resolvedBaseModel: baseModelId,
+            resolvedBaseModel: stripModelThinkingSuffix(baseModelId),
             thinkingLevel,
             acpModelId,
-            actualModelVersion: baseModelId,
+            actualModelVersion: stripModelThinkingSuffix(baseModelId),
             ttftMs: 0,
             durationMs: 0,
             stream: true,
@@ -565,10 +570,12 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         workerId: lease.worker.id,
         sessionCache: lease.isReusedSession ? "HIT" : "MISS",
         requestedModel,
-        resolvedBaseModel: baseModelId,
+        resolvedBaseModel: stripModelThinkingSuffix(baseModelId),
         thinkingLevel,
         acpModelId,
-        actualModelVersion: promptRes.actualModelVersion,
+        actualModelVersion: stripModelThinkingSuffix(
+          promptRes.actualModelVersion || baseModelId
+        ),
         ttftMs: promptRes.ttftMs,
         durationMs: promptRes.durationMs,
         stream: false,
@@ -583,7 +590,9 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         status: "success",
       });
 
-      const actualModel = promptRes.actualModelVersion || baseModelId;
+      const actualModel = stripModelThinkingSuffix(
+        promptRes.actualModelVersion || baseModelId
+      );
       c.header("X-Agy2Api-Actual-Model", actualModel);
       c.header("X-Agy2Api-TTFT-Ms", String(promptRes.ttftMs));
 
@@ -614,10 +623,10 @@ export function createGatewayApp(pool: WorkerPool): Hono {
         workerId: lease.worker.id,
         sessionCache: lease.isReusedSession ? "HIT" : "MISS",
         requestedModel,
-        resolvedBaseModel: baseModelId,
+        resolvedBaseModel: stripModelThinkingSuffix(baseModelId),
         thinkingLevel,
         acpModelId,
-        actualModelVersion: acpModelId,
+        actualModelVersion: stripModelThinkingSuffix(baseModelId),
         ttftMs: 0,
         durationMs: 0,
         stream: false,

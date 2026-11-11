@@ -145,14 +145,44 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r3.thinkingLevel, "high");
   assert.equal(r3.acpModelId, "gemini-4-argon-high");
 
-  // Test 4: Suffix stripping for API client responses
+  // Test 4: Suffix stripping for API client responses & extended Carbon variants
   assert.equal(stripModelThinkingSuffix("gemini-4-carbon-high"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-xhigh"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-max"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-minimal"), "gemini-4-carbon");
   assert.equal(stripModelThinkingSuffix("gemini-4-carbon (high)"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon:high"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-high-thinking"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-high-trial"), "gemini-4-carbon-trial");
+  assert.equal(stripModelThinkingSuffix("agy/gemini-4-carbon-high"), "gemini-4-carbon");
   assert.equal(stripModelThinkingSuffix("gemini-3.8-flash-low"), "gemini-3.8-flash");
   assert.equal(stripModelThinkingSuffix("gemini-3.8-flash (low)"), "gemini-3.8-flash");
   assert.equal(stripModelThinkingSuffix("claude-sonnet-5-5-high"), "claude-sonnet-5-5");
+  assert.equal(stripModelThinkingSuffix("claude-opus-5-5-max"), "claude-opus-5-5");
 
-  // Test 5: SQLite WAL Persistence & Cache Hit Rate formula (never exceeds 100% when cachedReadTokens > uncached inputTokens)
+  // Verify buildUnifiedModelCatalog strips -high/-xhigh/-max/-thinking and cleans raw display names
+  const extendedCatalog = buildUnifiedModelCatalog([
+    { modelId: "gemini-4-carbon-high", name: "gemini-4-carbon-high" },
+    { modelId: "gemini-4-carbon-xhigh", name: "Gemini 4 Carbon (XHigh)" },
+    { modelId: "claude-opus-5-5-max", name: "Claude Opus 5.5 (Max)" },
+  ]);
+  assert.equal(extendedCatalog.length, 2);
+  assert.equal(extendedCatalog[0].id, "gemini-4-carbon");
+  assert.equal(extendedCatalog[0].name, "Gemini 4 Carbon");
+  assert.equal(extendedCatalog[0].variants.high, "gemini-4-carbon-high");
+  assert.equal(extendedCatalog[1].id, "claude-opus-5-5");
+  assert.equal(extendedCatalog[1].name, "Claude Opus 5.5");
+
+  // Verify resolveModelAndThinking with explicit `-high` suffix always produces clean baseModelId
+  const rcHigh = resolveModelAndThinking(
+    { model: "gemini-4-carbon-high", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rcHigh.baseModelId, "gemini-4-carbon");
+  assert.equal(rcHigh.thinkingLevel, "high");
+  assert.equal(rcHigh.acpModelId, "gemini-4-carbon-high");
+
+  // Test 5: SQLite WAL Persistence, Suffix Stripping & Cache Hit Rate formula
   const tmpDbPath = path.join(os.tmpdir(), `agy2api-test-${Date.now()}.db`);
   const testStore = new TelemetryStore(tmpDbPath);
   const rec = testStore.recordCompletedRequest({
@@ -161,11 +191,11 @@ function testUnifiedModelAndEffortResolverUnit() {
     sessionId: "sess-test-1",
     workerId: "w-1",
     sessionCache: "HIT",
-    requestedModel: "gemini-3.8-flash",
-    resolvedBaseModel: "gemini-3.8-flash",
-    thinkingLevel: "medium",
-    acpModelId: "gemini-3.8-flash-medium",
-    actualModelVersion: "gemini-3.8-flash",
+    requestedModel: "gemini-4-carbon-high",
+    resolvedBaseModel: "gemini-4-carbon-high",
+    thinkingLevel: "high",
+    acpModelId: "gemini-4-carbon-high",
+    actualModelVersion: "gemini-4-carbon-high",
     ttftMs: 500,
     durationMs: 1000,
     stream: true,
@@ -180,6 +210,8 @@ function testUnifiedModelAndEffortResolverUnit() {
     status: "success",
   });
   assert.equal(rec.cacheHitRate, 90);
+  assert.equal(rec.resolvedBaseModel, "gemini-4-carbon");
+  assert.equal(rec.actualModelVersion, "gemini-4-carbon");
   testStore.close();
 
   // Reopen the SQLite database from disk to verify persistence across restarts
@@ -187,8 +219,12 @@ function testUnifiedModelAndEffortResolverUnit() {
   const snap = reopenedStore.getSnapshot();
   assert.equal(snap.summary.totalRequests, 1);
   assert.equal(snap.summary.cloudCacheHitRate, 90);
+  assert.equal(snap.recentRequests[0].resolvedBaseModel, "gemini-4-carbon");
+  assert.equal(snap.recentRequests[0].actualModelVersion, "gemini-4-carbon");
   assert.equal(snap.sessions.length, 1);
   assert.equal(snap.sessions[0].sessionId, "sess-test-1");
+  assert.equal(snap.sessions[0].baseModelId, "gemini-4-carbon");
+  assert.equal(snap.sessions[0].lastActualModelVersion, "gemini-4-carbon");
   assert.equal(snap.sessions[0].status, "CLOSED"); // Leftover ACTIVE session marked CLOSED on restart
   reopenedStore.close();
   fs.rmSync(tmpDbPath, { force: true });
@@ -420,7 +456,7 @@ async function runIntegrationTest() {
     assert.ok(turn2.content.includes("OMEGA-SH-7749"));
     assert.ok(turn2.usage?.prompt_tokens_details !== undefined);
 
-    console.log("\n6. [E2E Gemini 4 Carbon & Native Tool Guard Verification]...");
+    console.log("\n6. [E2E Gemini 4 Carbon (-high suffix) & Native Tool Guard Verification]...");
     const carbonRes = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -428,7 +464,7 @@ async function runIntegrationTest() {
         Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({
-        model: "gemini-4-carbon(low)",
+        model: "gemini-4-carbon-high",
         messages: [
           {
             role: "user",
@@ -442,7 +478,8 @@ async function runIntegrationTest() {
     });
     assert.equal(carbonRes.status, 200);
     assert.equal(carbonRes.headers.get("X-Agy2Api-Resolved-Model"), "gemini-4-carbon");
-    assert.equal(carbonRes.headers.get("X-Agy2Api-Thinking-Level"), "low");
+    assert.equal(carbonRes.headers.get("X-Agy2Api-Actual-Model"), "gemini-4-carbon");
+    assert.equal(carbonRes.headers.get("X-Agy2Api-Thinking-Level"), "high");
     const carbonJson = (await carbonRes.json()) as any;
     console.log("   -> Carbon Actual Model:", carbonJson.model);
     console.log("   -> Carbon Tool Calls:", JSON.stringify(carbonJson.choices[0].message.tool_calls));
@@ -455,6 +492,25 @@ async function runIntegrationTest() {
       carbonJson.usage.prompt_tokens + carbonJson.usage.completion_tokens,
       carbonJson.usage.total_tokens
     );
+
+    // Re-check GET /v1/models after live worker model sync to ensure no -high suffix leaked
+    const modelsAfterRes = await fetch(`${baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+    });
+    const modelsAfterJson = (await modelsAfterRes.json()) as {
+      data: Array<{ id: string; description: string }>;
+    };
+    assert.ok(modelsAfterJson.data.some((d) => d.id === "gemini-4-carbon"));
+    for (const m of modelsAfterJson.data) {
+      assert.ok(
+        !/-(low|medium|high|minimal|max|xhigh)$/i.test(m.id),
+        `Expected clean model id in /v1/models, got ${m.id}`
+      );
+      assert.ok(
+        !/-(low|medium|high|minimal|max|xhigh)$/i.test(m.description),
+        `Expected clean model description in /v1/models, got ${m.description}`
+      );
+    }
 
     console.log("\n7. [E2E Dashboard & Telemetry Verification] Checking /api/admin/overview...");
     const dashRes = await fetch(`${baseUrl}/`);
@@ -482,11 +538,17 @@ async function runIntegrationTest() {
     assert.ok(activeSess);
     assert.equal(activeSess.turns, 2);
     assert.equal(activeSess.hashHits, 1);
-    assert.ok(
-      overview.telemetry.recentRequests[0].actualModelVersion.includes("gemini-4-carbon")
+    assert.equal(
+      overview.telemetry.recentRequests[0].resolvedBaseModel,
+      "gemini-4-carbon"
     );
-    assert.ok(
-      overview.telemetry.recentRequests[1].actualModelVersion.includes("gemini-3.8-flash")
+    assert.equal(
+      overview.telemetry.recentRequests[0].actualModelVersion,
+      "gemini-4-carbon"
+    );
+    assert.equal(
+      overview.telemetry.recentRequests[1].actualModelVersion,
+      "gemini-3.8-flash"
     );
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
