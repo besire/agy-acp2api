@@ -467,36 +467,22 @@ func (a *App) handleModels() ([]byte, error) {
 
 	models := make([]ModelInfo, 0, len(listResp.Data))
 	newCache := make(map[string]bool, len(listResp.Data))
-	seen := make(map[string]bool, len(listResp.Data))
 	for _, m := range listResp.Data {
 		if m.ID == "" {
 			continue
 		}
-		cleanID := stripThinkingSuffix(m.ID)
-		if cleanID == "" {
-			cleanID = strings.TrimSpace(m.ID)
-		}
-		newCache[cleanID] = true
 		newCache[m.ID] = true
-		for _, lv := range []string{"low", "medium", "high", "minimal", "max", "xhigh"} {
-			newCache[cleanID+"-"+lv] = true
-		}
-		if seen[cleanID] {
-			continue
-		}
-		seen[cleanID] = true
-		cleanDesc := stripDisplaySuffix(m.Description)
-		if cleanDesc == "" {
-			cleanDesc = cleanID
+		for _, lv := range []string{"low", "medium", "high"} {
+			newCache[m.ID+"-"+lv] = true
 		}
 		models = append(models, ModelInfo{
-			ID:                         cleanID,
+			ID:                         m.ID,
 			Object:                     "model",
 			Created:                    m.Created,
 			OwnedBy:                    PluginID,
-			DisplayName:                cleanDesc,
-			Name:                       cleanID,
-			Description:                cleanDesc,
+			DisplayName:                m.Description,
+			Name:                       m.ID,
+			Description:                m.Description,
 			SupportedGenerationMethods: []string{"chat"},
 			UserDefined:                true,
 		})
@@ -512,111 +498,6 @@ func (a *App) handleModels() ([]byte, error) {
 	})
 }
 
-func stripThinkingSuffix(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return s
-	}
-	if strings.HasPrefix(strings.ToLower(s), "agy/") {
-		s = strings.TrimSpace(s[4:])
-	}
-	lower := strings.ToLower(s)
-	levels := []string{"low", "medium", "high", "minimal", "min", "med", "normal", "auto", "max", "xhigh", "extra high", "deep"}
-
-	// Bracket syntax: e.g. gemini-4-carbon(high), gemini-4-carbon [low]
-	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
-		if strings.HasSuffix(lower, pair[1]) {
-			if idx := strings.LastIndex(lower, pair[0]); idx > 0 {
-				inner := strings.TrimSpace(lower[idx+1 : len(lower)-1])
-				for _, lv := range levels {
-					if inner == lv {
-						return strings.TrimSpace(s[:idx])
-					}
-				}
-			}
-		}
-	}
-
-	// Optional trailing -thinking after effort suffix: e.g. gemini-4-carbon-high-thinking
-	if strings.HasSuffix(lower, "-thinking") {
-		candidate := s[:len(s)-len("-thinking")]
-		candLower := lower[:len(lower)-len("-thinking")]
-		if idx := strings.LastIndex(candLower, "-"); idx > 0 {
-			tail := candLower[idx+1:]
-			for _, lv := range levels {
-				if tail == lv {
-					return strings.TrimSpace(candidate[:idx])
-				}
-			}
-		}
-	}
-
-	// Effort suffix before -trial / -preview / -exp: e.g. gemini-4-carbon-high-trial -> gemini-4-carbon-trial
-	for _, tag := range []string{"-trial", "-preview", "-exp"} {
-		if strings.HasSuffix(lower, tag) {
-			prefix := s[:len(s)-len(tag)]
-			prefixLower := lower[:len(lower)-len(tag)]
-			if idx := strings.LastIndex(prefixLower, "-"); idx > 0 {
-				tail := prefixLower[idx+1:]
-				for _, lv := range levels {
-					if tail == lv {
-						return strings.TrimSpace(prefix[:idx]) + s[len(s)-len(tag):]
-					}
-				}
-			}
-		}
-	}
-
-	// Delimiter syntax: e.g. gemini-4-carbon:high, gemini-4-carbon@low, gemini-4-carbon-high, gemini-4-carbon-xhigh
-	for _, sep := range []string{":", "@", "/", "-"} {
-		if idx := strings.LastIndex(lower, sep); idx > 0 {
-			tail := strings.TrimSpace(lower[idx+1:])
-			for _, lv := range levels {
-				if sep == "-" && lv == "extra high" {
-					continue
-				}
-				if tail == lv {
-					return strings.TrimSpace(s[:idx])
-				}
-			}
-		}
-	}
-	return s
-}
-
-func stripDisplaySuffix(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
-		return s
-	}
-	if !strings.Contains(s, " ") {
-		return stripThinkingSuffix(s)
-	}
-	levels := []string{"low", "medium", "high", "minimal", "min", "med", "normal", "auto", "max", "xhigh", "extra high", "deep"}
-	lower := strings.ToLower(s)
-	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
-		if strings.HasSuffix(lower, pair[1]) {
-			if idx := strings.LastIndex(lower, pair[0]); idx > 0 {
-				inner := strings.TrimSpace(lower[idx+1 : len(lower)-1])
-				for _, lv := range levels {
-					if inner == lv {
-						return strings.TrimSpace(s[:idx])
-					}
-				}
-			}
-		}
-	}
-	for _, lv := range []string{"extra high", "xhigh", "minimal", "medium", "high", "low", "max"} {
-		if strings.HasSuffix(lower, " "+lv) {
-			trimmed := strings.TrimRight(strings.TrimSpace(s[:len(s)-len(lv)]), "-:| ")
-			if trimmed != "" {
-				return trimmed
-			}
-		}
-	}
-	return s
-}
-
 func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 	var req ModelRouteRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -627,22 +508,13 @@ func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 		return OKEnvelope(ModelRouteResponse{Handled: false})
 	}
 
-	baseModel := stripThinkingSuffix(model)
-
 	a.mu.RLock()
 	enabled := a.cfg.Enabled
-	known := a.cachedModels[model] || a.cachedModels[baseModel]
+	known := a.cachedModels[model]
 	a.mu.RUnlock()
 
 	if !enabled {
 		return OKEnvelope(ModelRouteResponse{Handled: false})
-	}
-
-	if !known && !strings.HasPrefix(model, "agy/") {
-		_, _ = a.handleModels()
-		a.mu.RLock()
-		known = a.cachedModels[model] || a.cachedModels[baseModel]
-		a.mu.RUnlock()
 	}
 
 	if strings.HasPrefix(model, "agy/") {

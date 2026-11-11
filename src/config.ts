@@ -21,25 +21,12 @@ export interface GatewayConfig {
 
 const SETTINGS_FILE_PATH = path.resolve(process.cwd(), "settings.json");
 
-function cleanBaseModelName(raw?: string): string | undefined {
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  return trimmed
-    .replace(/^agy\//i, "")
-    .replace(/\s*[([]\s*(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|extra\s+high|deep)\s*[)\]]\s*$/i, "")
-    .replace(/[:@/]\s*(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|extra\s+high|deep)\s*$/i, "")
-    .replace(/-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?:-thinking)?$/i, "")
-    .trim();
-}
-
 const defaultConfig: GatewayConfig = {
   host: process.env.AGY2API_HOST || "127.0.0.1",
   port: parseInt(process.env.AGY2API_PORT || "8787", 10),
   apiKey: process.env.AGY2API_KEY || "sk-agy2api-local-key",
   agyBin: process.env.AGY_BIN || "agy",
-  defaultModel:
-    cleanBaseModelName(process.env.AGY_DEFAULT_MODEL) || "gemini-3.8-flash",
+  defaultModel: process.env.AGY_DEFAULT_MODEL || "gemini-3.8-flash",
   defaultThinkingLevel:
     (process.env.AGY_DEFAULT_THINKING_LEVEL as ThinkingLevel) || "medium",
   minWorkers: parseInt(process.env.AGY_MIN_WORKERS || "1", 10),
@@ -60,12 +47,7 @@ function loadPersistedSettings(): Partial<GatewayConfig> {
   try {
     if (fs.existsSync(SETTINGS_FILE_PATH)) {
       const raw = fs.readFileSync(SETTINGS_FILE_PATH, "utf-8");
-      const parsed = JSON.parse(raw);
-      if (typeof parsed.defaultModel === "string") {
-        parsed.defaultModel =
-          cleanBaseModelName(parsed.defaultModel) || parsed.defaultModel;
-      }
-      return parsed;
+      return JSON.parse(raw);
     }
   } catch {
     // Ignore corrupted settings file and use defaults
@@ -92,8 +74,7 @@ export function updateGatewayConfig(
     config.apiKey = patch.apiKey.trim();
   }
   if (typeof patch.defaultModel === "string" && patch.defaultModel.trim()) {
-    config.defaultModel =
-      cleanBaseModelName(patch.defaultModel) || patch.defaultModel.trim();
+    config.defaultModel = patch.defaultModel.trim();
   }
   if (
     patch.defaultThinkingLevel &&

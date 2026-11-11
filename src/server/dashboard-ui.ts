@@ -642,17 +642,6 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return t === "c-ok" ? "var(--success)" : t === "c-mid" ? "var(--primary)" : t === "c-slow" ? "var(--warning)" : "var(--outline)";
   }
   function isTrial(m) { return /trial/i.test(m || ""); }
-  function cleanModel(m) {
-    if (!m) return "";
-    return String(m)
-      .trim()
-      .replace(/^agy\//i, "")
-      .replace(/\s*[([]\s*(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|extra\s+high|deep)\s*[)\]]\s*$/i, "")
-      .replace(/[:@/]\s*(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|extra\s+high|deep)\s*$/i, "")
-      .replace(/-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?=-(?:trial|preview|exp)\b)/i, "")
-      .replace(/-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?:-thinking)?$/i, "")
-      .trim();
-  }
 
   /* ---------- visual atoms ---------- */
   function lv(level) {
@@ -660,10 +649,9 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return '<span class="lv l' + n + '" data-tip="思考 ' + esc(level || "-") + '"><i></i><i></i><i></i></span>';
   }
   function upChip(m, big) {
-    var cm = cleanModel(m);
-    var t = isTrial(cm || m);
+    var t = isTrial(m);
     return '<span class="chip mono ' + (big ? "lg " : "") + (t ? "t-warn" : "t-plain") + '" data-tip="' + (t ? "trial 路由" : "上游模型") + '">' +
-      (t ? '<span class="ms">warning</span>' : "") + esc(cm || "–") + "</span>";
+      (t ? '<span class="ms">warning</span>' : "") + esc(m || "–") + "</span>";
   }
   function sessChip(hit, sid) {
     return hit
@@ -793,20 +781,20 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     var last = chrono.slice(-40);
     $("chart-tok").innerHTML = barChart(last,
       function (r) { return tokParts(r).slice(0, 3); },
-      function (r) { return clock(r.timestamp) + "  " + cleanModel(r.actualModelVersion) + "\n" + tokTip(r) + "\n命中 " + pct(r.cacheHitRate); },
+      function (r) { return clock(r.timestamp) + "  " + (r.actualModelVersion || "") + "\n" + tokTip(r) + "\n命中 " + pct(r.cacheHitRate); },
       tok, 0);
     var okT = last.filter(function (r) { return r.ttftMs > 0; });
     var avg = okT.length ? okT.reduce(function (a, r) { return a + r.ttftMs; }, 0) / okT.length : 0;
     $("chart-ttft").innerHTML = barChart(last,
       function (r) { return [[r.ttftMs || 0, toneColor(r)]]; },
-      function (r) { return clock(r.timestamp) + "  " + cleanModel(r.actualModelVersion) + "\nTTFT " + ms(r.ttftMs) + "\n总耗时 " + ms(r.durationMs); },
+      function (r) { return clock(r.timestamp) + "  " + (r.actualModelVersion || "") + "\nTTFT " + ms(r.ttftMs) + "\n总耗时 " + ms(r.durationMs); },
       ms, avg);
 
     // upstream routes
     var m = {};
     reqs.forEach(function (r) {
       if (r.status !== "success") return;
-      var k = cleanModel(r.actualModelVersion) || "–", o = m[k] || (m[k] = { n: 0, tt: 0, ttn: 0, tp: 0, tpn: 0 });
+      var k = r.actualModelVersion || "–", o = m[k] || (m[k] = { n: 0, tt: 0, ttn: 0, tp: 0, tpn: 0 });
       o.n++;
       if (r.ttftMs > 0) { o.tt += r.ttftMs; o.ttn++; }
       var t = tps(r); if (t > 0) { o.tp += t; o.tpn++; }
@@ -848,7 +836,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
           return '<tr data-act="open-req" data-id="' + esc(r.requestId) + '">' +
             '<td class="mono muted">' + clock(r.timestamp) + "</td>" +
             "<td>" + sessChip(r.sessionCache === "HIT", r.sessionId) + "</td>" +
-            '<td><span class="model">' + esc(cleanModel(r.resolvedBaseModel)) + lv(r.thinkingLevel) + "</span></td>" +
+            '<td><span class="model">' + esc(r.resolvedBaseModel) + lv(r.thinkingLevel) + "</span></td>" +
             "<td>" + upChip(r.actualModelVersion) + "</td>" +
             '<td class="r mono ' + tone(r.ttftMs) + '">' + ms(r.ttftMs) + "</td>" +
             '<td class="r mono muted">' + ms(r.durationMs) + "</td>" +
@@ -867,7 +855,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
           var act = s.status === "ACTIVE", hitP = s.turns ? (s.hashHits / s.turns) * 100 : 0;
           return '<tr data-act="open-sess" data-id="' + esc(s.sessionId) + '">' +
             '<td><span class="sid"><span class="dot ' + (act ? "ok pulse" : "") + '" data-tip="' + (act ? "存续" : "已关闭") + '"></span><span class="mono">' + esc(s.sessionId.slice(0, 8)) + "</span></span></td>" +
-            '<td><span class="model">' + esc(cleanModel(s.baseModelId)) + lv(s.lastThinkingLevel) + "</span></td>" +
+            '<td><span class="model">' + esc(s.baseModelId) + lv(s.lastThinkingLevel) + "</span></td>" +
             "<td>" + upChip(s.lastActualModelVersion) + "</td>" +
             '<td><div class="turns" data-tip="复用 ' + s.hashHits + " / " + s.turns + '"><span class="mono">' + s.turns + '</span><div class="lin ok"><i style="width:' + hitP + '%"></i></div></div></td>' +
             "<td>" + tokCell(s) + "</td>" +
@@ -920,7 +908,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         return '<tr data-act="open-sess" data-id="' + esc(s.sessionId) + '">' +
           '<td><span class="sid"><span class="dot ok pulse"></span><span class="mono">' + esc(s.sessionId.slice(0, 8)) + "</span></span></td>" +
           '<td><span class="chip t-plain"><span class="ms">memory</span><span class="mono">' + esc(s.workerId) + "</span></span></td>" +
-          '<td><span class="model">' + esc(cleanModel(s.baseModelId)) + lv(s.lastThinkingLevel) + "</span></td>" +
+          '<td><span class="model">' + esc(s.baseModelId) + lv(s.lastThinkingLevel) + "</span></td>" +
           '<td class="mono" data-tip="' + dateTime(s.createdAt) + '">' + span(now - s.createdAt) + "</td>" +
           '<td><div style="display:flex;align-items:center;gap:8px;width:140px"><div class="lin' + (rem / ttl > 0.25 ? " ok" : "") + '" style="flex:1"><i style="width:' + (rem / ttl) * 100 + '%"></i></div><span class="mono muted">' + span(rem) + "</span></div></td>" +
           '<td class="mono">' + s.turns + "</td>" +
@@ -930,16 +918,11 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   /* ---------- settings ---------- */
   function fillModels(d) {
-    var defModel = cleanModel(d.config.defaultModel) || d.config.defaultModel;
-    var sel = $("f-model"), cur = cleanModel(sel.value) || defModel;
-    var ids = [];
-    d.unifiedModels.forEach(function (m) {
-      var cid = cleanModel(m.id) || m.id;
-      if (ids.indexOf(cid) < 0) ids.push(cid);
-    });
-    if (ids.indexOf(defModel) < 0) ids.unshift(defModel);
+    var sel = $("f-model"), cur = sel.value || d.config.defaultModel;
+    var ids = d.unifiedModels.map(function (m) { return m.id; });
+    if (ids.indexOf(d.config.defaultModel) < 0) ids.unshift(d.config.defaultModel);
     var html = ids.map(function (id) {
-      var m = d.unifiedModels.filter(function (x) { return (cleanModel(x.id) || x.id) === id; })[0];
+      var m = d.unifiedModels.filter(function (x) { return x.id === id; })[0];
       return '<option value="' + esc(id) + '">' + esc(m && m.name && m.name !== id ? id + " · " + m.name : id) + "</option>";
     }).join("");
     if (sel.innerHTML !== html) { sel.innerHTML = html; }
@@ -1021,7 +1004,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return '<div class="hero">' + upChip(r.actualModelVersion, true) + '<span class="mono muted">' + dateTime(r.timestamp) + "</span></div>" +
       sec("route", "路由",
         kv("请求", '<span class="mono">' + esc(r.requestedModel) + "</span>") +
-        kv("解析", '<span class="model">' + esc(cleanModel(r.resolvedBaseModel)) + lv(r.thinkingLevel) + "</span>") +
+        kv("解析", '<span class="model">' + esc(r.resolvedBaseModel) + lv(r.thinkingLevel) + "</span>") +
         kv("ACP", '<span class="mono">' + esc(r.acpModelId) + "</span>") +
         kv("上游", upChip(r.actualModelVersion))) +
       sec("timer", "耗时",
@@ -1052,7 +1035,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       '<div class="stat"><span class="ms">token</span><span class="big">' + tok(allTok(s)) + "</span></div></div>" +
       sec("token", "Token", stack(tokParts(s), 12) + tokLegend(s)) +
       sec("info", "详情",
-        kv("模型", '<span class="model">' + esc(cleanModel(s.baseModelId)) + lv(s.lastThinkingLevel) + "</span>") +
+        kv("模型", '<span class="model">' + esc(s.baseModelId) + lv(s.lastThinkingLevel) + "</span>") +
         kv("ACP", '<span class="mono">' + esc(s.lastAcpModelId) + "</span>") +
         kv("创建", '<span class="mono">' + dateTime(s.createdAt) + "</span>") +
         kv("活跃", '<span class="mono">' + dateTime(s.lastActiveAt) + "</span>")) +

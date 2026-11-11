@@ -19,68 +19,18 @@ export interface ResolvedModelTarget {
 
 const LEVEL_ORDER: ThinkingLevel[] = ["low", "medium", "high"];
 
-const THINKING_SUFFIX_TOKENS =
-  "low|medium|high|minimal|min|med|normal|auto|max|xhigh|extra\\s+high|deep";
-
 /**
- * Strips any thinking level suffix (`-low`, `-medium`, `-high`, `-xhigh`, `-max`, `(low)`, `:high`, etc.)
- * so model names returned to API clients and dashboards are always clean base model identifiers.
+ * Strips any thinking level suffix (`-low`, `-medium`, `-high`, `(low)`, `:high`, etc.)
+ * so model names returned to API clients are always clean base model identifiers.
  */
 export function stripModelThinkingSuffix(rawModel: string): string {
   if (!rawModel) return rawModel;
   return rawModel
     .trim()
-    .replace(/^agy\//i, "")
-    .replace(
-      new RegExp(
-        `\\s*[([]\\s*(?:${THINKING_SUFFIX_TOKENS})\\s*[)\\]]\\s*$`,
-        "i"
-      ),
-      ""
-    )
-    .replace(
-      new RegExp(`[:@/]\\s*(?:${THINKING_SUFFIX_TOKENS})\\s*$`, "i"),
-      ""
-    )
-    .replace(
-      /-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?=-(?:trial|preview|exp)\b)/i,
-      ""
-    )
-    .replace(
-      /-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?:-thinking)?$/i,
-      ""
-    )
+    .replace(/\s*[([]\s*(?:low|medium|high|minimal|max|xhigh)\s*[)\]]\s*$/i, "")
+    .replace(/[:@/]\s*(?:low|medium|high|minimal|max|xhigh)\s*$/i, "")
+    .replace(/-(?:low|medium|high)$/i, "")
     .trim();
-}
-
-export function cleanModelDisplayName(rawName: string, baseId: string): string {
-  if (!rawName) return baseId;
-  let cleaned = rawName
-    .trim()
-    .replace(
-      new RegExp(
-        `\\s*[([]\\s*(?:${THINKING_SUFFIX_TOKENS})\\s*[)\\]]\\s*$`,
-        "i"
-      ),
-      ""
-    )
-    .replace(
-      new RegExp(
-        `\\s*[-–—:|@/]+\\s*(?:${THINKING_SUFFIX_TOKENS})\\s*$`,
-        "i"
-      ),
-      ""
-    )
-    .replace(
-      /\s+(?:low|medium|high|minimal|max|xhigh|extra\s+high)\s*$/i,
-      ""
-    )
-    .trim();
-
-  if (!cleaned.includes(" ")) {
-    cleaned = stripModelThinkingSuffix(cleaned);
-  }
-  return cleaned || baseId;
 }
 
 export function normalizeThinkingLevel(raw?: string | null): ThinkingLevel | null {
@@ -88,65 +38,13 @@ export function normalizeThinkingLevel(raw?: string | null): ThinkingLevel | nul
   const v = raw.trim().toLowerCase();
   if (v === "low" || v === "minimal" || v === "min") return "low";
   if (v === "medium" || v === "med" || v === "normal" || v === "auto") return "medium";
-  if (v === "high" || v === "xhigh" || v === "max" || v === "extra high" || v === "deep") return "high";
+  if (v === "high" || v === "xhigh" || v === "max" || v === "deep") return "high";
   return null;
 }
 
-function extractModelVariant(rawModelId: string): {
-  baseId: string;
-  level: ThinkingLevel | null;
-  isCanonicalLevel: boolean;
-} {
-  const trimmed = rawModelId.trim().replace(/^agy\//i, "");
-
-  // 1. Bracket/colon/at/slash syntax: e.g. `gemini-4-carbon(high)`, `gemini-4-carbon:low`, `gemini-4-carbon@high`
-  const symbolMatch = trimmed.match(
-    new RegExp(
-      `^(.*?)(?:[:@/(\\[]\\s*(${THINKING_SUFFIX_TOKENS})\\s*[)\\]]?)$`,
-      "i"
-    )
-  );
-  if (symbolMatch) {
-    const rawLv = symbolMatch[2].trim().toLowerCase();
-    const level = normalizeThinkingLevel(rawLv);
-    const baseId = stripModelThinkingSuffix(symbolMatch[1]);
-    return {
-      baseId,
-      level,
-      isCanonicalLevel: rawLv === level,
-    };
-  }
-
-  // 2. Hyphen suffix syntax: e.g. `gemini-4-carbon-high`, `gemini-4-carbon-xhigh`, `gemini-4-carbon-high-thinking`
-  const hyphenMatch = trimmed.match(
-    /^(.*?)-(low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?:-(thinking|trial|preview|exp))?$/i
-  );
-  if (hyphenMatch) {
-    const rawLv = hyphenMatch[2].toLowerCase();
-    const level = normalizeThinkingLevel(rawLv);
-    const trailingTag = hyphenMatch[3]?.toLowerCase();
-    const prefixBase = stripModelThinkingSuffix(hyphenMatch[1]);
-    const baseId =
-      trailingTag && trailingTag !== "thinking" && trailingTag !== "trial"
-        ? `${prefixBase}-${trailingTag}`
-        : prefixBase;
-    return {
-      baseId,
-      level,
-      isCanonicalLevel: rawLv === level && !trailingTag,
-    };
-  }
-
-  return {
-    baseId: stripModelThinkingSuffix(trimmed),
-    level: null,
-    isCanonicalLevel: false,
-  };
-}
-
 /**
- * Aggregates raw ACP model entries (e.g. `gemini-4-carbon-low/medium/high`, `gemini-4-argon-low/medium/high`)
- * into unified base models (`gemini-4-carbon`, `gemini-4-argon` with `thinkingLevels: ["low", "medium", "high"]`).
+ * Aggregates raw ACP model entries (e.g. `gemini-4-argon-low/medium/high`)
+ * into unified base models (`gemini-4-argon` with `thinkingLevels: ["low", "medium", "high"]`).
  */
 export function buildUnifiedModelCatalog(
   rawModels: AcpModelInfo[]
@@ -154,13 +52,12 @@ export function buildUnifiedModelCatalog(
   const map = new Map<string, UnifiedModelCatalogItem>();
 
   for (const m of rawModels) {
-    const rawId = (m.modelId || "").trim();
-    if (!rawId) continue;
+    const match = m.modelId.match(/^(.*)-(low|medium|high)$/i);
+    if (match) {
+      const baseId = match[1];
+      const level = match[2].toLowerCase() as ThinkingLevel;
+      const cleanName = m.name.replace(/\s*\((Low|Medium|High)\)\s*$/i, "").trim();
 
-    const { baseId, level, isCanonicalLevel } = extractModelVariant(rawId);
-    const cleanName = cleanModelDisplayName(m.name || baseId, baseId);
-
-    if (level) {
       let item = map.get(baseId);
       if (!item) {
         item = {
@@ -171,26 +68,22 @@ export function buildUnifiedModelCatalog(
           variants: {},
         };
         map.set(baseId, item);
-      } else if (item.name === item.id && cleanName && cleanName !== baseId) {
-        item.name = cleanName;
       }
 
       if (!item.thinkingLevels.includes(level)) {
         item.thinkingLevels.push(level);
       }
-      if (!item.variants[level] || isCanonicalLevel) {
-        item.variants[level] = rawId;
-      }
+      item.variants[level] = m.modelId;
     } else {
-      // Model without thinking effort suffix
-      if (!map.has(baseId)) {
-        map.set(baseId, {
-          id: baseId,
-          name: cleanName || baseId,
+      // Model without -low/-medium/-high suffix
+      if (!map.has(m.modelId)) {
+        map.set(m.modelId, {
+          id: m.modelId,
+          name: m.name || m.modelId,
           thinkingLevels: ["medium"],
           defaultThinkingLevel: "medium",
           variants: {
-            medium: rawId,
+            medium: m.modelId,
           },
         });
       }
@@ -223,11 +116,25 @@ export function resolveModelAndThinking(
 ): ResolvedModelTarget {
   const catalog = buildUnifiedModelCatalog(rawModels);
   const rawModelStr = (req.model || config.defaultModel || "gemini-3.8-flash").trim();
-  const normalizedModelStr = rawModelStr.replace(/^agy\//i, "").trim();
 
-  const parsedVariant = extractModelVariant(normalizedModelStr);
-  const candidateBase = parsedVariant.baseId;
-  const suffixLevel = parsedVariant.level;
+  let candidateBase = rawModelStr;
+  let suffixLevel: ThinkingLevel | null = null;
+
+  // 1. Check bracket/colon/at/slash syntax: e.g. `gemini-4-argon(high)`, `gemini-4-argon:low`, `gemini-4-argon@high`
+  const symbolMatch = candidateBase.match(
+    /^(.*?)(?:[:@/(\[]\s*(low|medium|high|minimal|max|xhigh)\s*[)\]]?)$/i
+  );
+  if (symbolMatch) {
+    candidateBase = symbolMatch[1].trim();
+    suffixLevel = normalizeThinkingLevel(symbolMatch[2]);
+  } else {
+    // 2. Check hyphen suffix syntax: e.g. `gemini-4-argon-high`
+    const hyphenMatch = candidateBase.match(/^(.*)-(low|medium|high)$/i);
+    if (hyphenMatch) {
+      candidateBase = hyphenMatch[1].trim();
+      suffixLevel = normalizeThinkingLevel(hyphenMatch[2]);
+    }
+  }
 
   // 3. Check request body reasoning parameters (`reasoning_effort`, `thinking`, `reasoning`)
   let bodyLevel: ThinkingLevel | null = null;
@@ -258,7 +165,7 @@ export function resolveModelAndThinking(
   // 4. Match against unified catalog
   const catalogEntry =
     catalog.find((c) => c.id.toLowerCase() === candidateBase.toLowerCase()) ||
-    catalog.find((c) => c.id.toLowerCase() === normalizedModelStr.toLowerCase());
+    catalog.find((c) => c.id.toLowerCase() === rawModelStr.toLowerCase());
 
   if (catalogEntry) {
     const effectiveLevel = catalogEntry.variants[desiredLevel]
@@ -271,20 +178,15 @@ export function resolveModelAndThinking(
 
     return {
       requestedModel: rawModelStr,
-      baseModelId: stripModelThinkingSuffix(catalogEntry.id),
+      baseModelId: catalogEntry.id,
       thinkingLevel: effectiveLevel,
       acpModelId,
     };
   }
 
   // Fallback if custom/unlisted model ID is passed
-  const hasExplicitHyphenVariant =
-    !bodyLevel &&
-    /-(?:low|medium|high|minimal|min|med|normal|auto|max|xhigh|deep)(?:-(?:thinking|trial|preview|exp))?$/i.test(
-      normalizedModelStr
-    );
-  const fallbackAcpId = hasExplicitHyphenVariant
-    ? normalizedModelStr
+  const fallbackAcpId = rawModelStr.match(/-(low|medium|high)$/i)
+    ? rawModelStr
     : `${candidateBase}-${desiredLevel}`;
 
   return {
