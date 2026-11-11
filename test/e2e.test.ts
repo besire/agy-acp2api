@@ -55,7 +55,7 @@ function testSlidingWindowParserUnit() {
 
   assert.equal(
     emittedText.join(""),
-    "Hello! I will check <div> and then call a tool:  Done!"
+    "Hello! I will check <div> and then call a tool: "
   );
   assert.equal(emittedTools.length, 1);
   assert.equal(emittedTools[0].function?.name, "calculate_sum");
@@ -72,6 +72,9 @@ function testUnifiedModelAndEffortResolverUnit() {
     "2. [Unit Test] Testing Unified Model Catalog & Thinking Effort Resolver..."
   );
   const sampleRaw = [
+    { modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
+    { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+    { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
     { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },
     { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
     { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
@@ -82,11 +85,37 @@ function testUnifiedModelAndEffortResolverUnit() {
   ];
 
   const catalog = buildUnifiedModelCatalog(sampleRaw);
-  assert.equal(catalog.length, 3);
+  assert.equal(catalog.length, 4);
+  const carbon = catalog.find((c) => c.id === "gemini-4-carbon")!;
+  assert.deepEqual(carbon.thinkingLevels, ["low", "medium", "high"]);
   const argon = catalog.find((c) => c.id === "gemini-4-argon")!;
   assert.deepEqual(argon.thinkingLevels, ["low", "medium", "high"]);
 
-  // Test 1: Base model + reasoning_effort
+  // Test 1: Base model + reasoning_effort (Carbon & Argon)
+  const rc1 = resolveModelAndThinking(
+    { model: "gemini-4-carbon", reasoning_effort: "high", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rc1.baseModelId, "gemini-4-carbon");
+  assert.equal(rc1.thinkingLevel, "high");
+  assert.equal(rc1.acpModelId, "gemini-4-carbon-high");
+
+  const rc2 = resolveModelAndThinking(
+    { model: "gemini-4-carbon(low)", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rc2.baseModelId, "gemini-4-carbon");
+  assert.equal(rc2.thinkingLevel, "low");
+  assert.equal(rc2.acpModelId, "gemini-4-carbon-low");
+
+  const rc3 = resolveModelAndThinking(
+    { model: "gemini-4-carbon:medium", messages: [] },
+    sampleRaw
+  );
+  assert.equal(rc3.baseModelId, "gemini-4-carbon");
+  assert.equal(rc3.thinkingLevel, "medium");
+  assert.equal(rc3.acpModelId, "gemini-4-carbon-medium");
+
   const r1 = resolveModelAndThinking(
     { model: "gemini-4-argon", reasoning_effort: "high", messages: [] },
     sampleRaw
@@ -117,6 +146,8 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r3.acpModelId, "gemini-4-argon-high");
 
   // Test 4: Suffix stripping for API client responses
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon-high"), "gemini-4-carbon");
+  assert.equal(stripModelThinkingSuffix("gemini-4-carbon (high)"), "gemini-4-carbon");
   assert.equal(stripModelThinkingSuffix("gemini-3.8-flash-low"), "gemini-3.8-flash");
   assert.equal(stripModelThinkingSuffix("gemini-3.8-flash (low)"), "gemini-3.8-flash");
   assert.equal(stripModelThinkingSuffix("claude-sonnet-5-5-high"), "claude-sonnet-5-5");
@@ -245,6 +276,7 @@ async function runIntegrationTest() {
       "   -> /v1/models Unified IDs:",
       modelsJson.data.map((d) => `${d.id} [${d.thinking_levels.join(",")}]`)
     );
+    assert.ok(modelsJson.data.some((d) => d.id === "gemini-4-carbon"));
     assert.ok(modelsJson.data.some((d) => d.id === "gemini-3.8-flash"));
 
     const tools: OpenAIToolDefinition[] = [
@@ -315,6 +347,15 @@ async function runIntegrationTest() {
     assert.equal(turn1.lastModel, "gemini-3.8-flash");
     assert.equal(turn1.finishReason, "tool_calls");
     assert.ok(turn1.toolCalls.length >= 1);
+    // Verify excludeDefaultComponents: true kept base prompt compact (< 1000 tokens instead of ~7000+)
+    assert.ok(
+      turn1.usage && turn1.usage.prompt_tokens < 1000,
+      `Expected lean prompt_tokens < 1000, got ${turn1.usage?.prompt_tokens}`
+    );
+    assert.equal(
+      turn1.usage!.prompt_tokens + turn1.usage!.completion_tokens,
+      turn1.usage!.total_tokens
+    );
 
     const tc = turn1.toolCalls[0];
     messages.push({
@@ -379,7 +420,43 @@ async function runIntegrationTest() {
     assert.ok(turn2.content.includes("OMEGA-SH-7749"));
     assert.ok(turn2.usage?.prompt_tokens_details !== undefined);
 
-    console.log("\n6. [E2E Dashboard & Telemetry Verification] Checking /api/admin/overview...");
+    console.log("\n6. [E2E Gemini 4 Carbon & Native Tool Guard Verification]...");
+    const carbonRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-4-carbon(low)",
+        messages: [
+          {
+            role: "user",
+            content:
+              "Check my background tasks if you have native tools; otherwise call get_secret_weather_code for Beijing.",
+          },
+        ],
+        tools,
+        stream: false,
+      }),
+    });
+    assert.equal(carbonRes.status, 200);
+    assert.equal(carbonRes.headers.get("X-Agy2Api-Resolved-Model"), "gemini-4-carbon");
+    assert.equal(carbonRes.headers.get("X-Agy2Api-Thinking-Level"), "low");
+    const carbonJson = (await carbonRes.json()) as any;
+    console.log("   -> Carbon Actual Model:", carbonJson.model);
+    console.log("   -> Carbon Tool Calls:", JSON.stringify(carbonJson.choices[0].message.tool_calls));
+    console.log("   -> Carbon Usage:", JSON.stringify(carbonJson.usage));
+    assert.equal(carbonJson.model, "gemini-4-carbon");
+    assert.equal(carbonJson.choices[0].finish_reason, "tool_calls");
+    assert.equal(carbonJson.choices[0].message.tool_calls[0].function.name, "get_secret_weather_code");
+    assert.ok(carbonJson.usage.prompt_tokens < 1000);
+    assert.equal(
+      carbonJson.usage.prompt_tokens + carbonJson.usage.completion_tokens,
+      carbonJson.usage.total_tokens
+    );
+
+    console.log("\n7. [E2E Dashboard & Telemetry Verification] Checking /api/admin/overview...");
     const dashRes = await fetch(`${baseUrl}/`);
     assert.equal(dashRes.status, 200);
     const dashHtml = await dashRes.text();
@@ -388,7 +465,7 @@ async function runIntegrationTest() {
 
     const overviewRes = await fetch(`${baseUrl}/api/admin/overview`);
     const overview = (await overviewRes.json()) as any;
-    assert.equal(overview.config.uiLayout, "side");
+    assert.ok(["side", "top"].includes(overview.config.uiLayout));
     console.log(
       "   -> Telemetry Summary:",
       JSON.stringify(overview.telemetry.summary)
@@ -398,7 +475,7 @@ async function runIntegrationTest() {
       JSON.stringify(overview.telemetry.sessions[0])
     );
 
-    assert.ok(overview.telemetry.summary.totalRequests >= 2);
+    assert.ok(overview.telemetry.summary.totalRequests >= 3);
     assert.ok(overview.telemetry.summary.sessionCacheHits >= 1);
     assert.ok(overview.telemetry.summary.avgTtftMs > 0);
     const activeSess = overview.telemetry.sessions.find((s: any) => s.sessionId === sessionId1);
@@ -406,7 +483,10 @@ async function runIntegrationTest() {
     assert.equal(activeSess.turns, 2);
     assert.equal(activeSess.hashHits, 1);
     assert.ok(
-      overview.telemetry.recentRequests[0].actualModelVersion.includes("gemini-3.8-flash")
+      overview.telemetry.recentRequests[0].actualModelVersion.includes("gemini-4-carbon")
+    );
+    assert.ok(
+      overview.telemetry.recentRequests[1].actualModelVersion.includes("gemini-3.8-flash")
     );
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");

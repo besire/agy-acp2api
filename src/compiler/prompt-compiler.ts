@@ -7,8 +7,9 @@ export interface CompiledContext {
 }
 
 /**
- * Builds the system prompt append instructions injected into `session/new` via `_meta.antigravity.systemPrompt.append`.
- * Explicitly disables all native ACP tools and enforces XML `<tool_call>` formatting when external tools are present.
+ * Builds the minimal system prompt append instructions injected into `session/new` via `_meta.antigravity.systemPrompt.append`.
+ * Paired with the worker's `excludeDefaultComponents: true` custom agent, only a single-line guard is needed
+ * to suppress the residual `manage_task` control-plane tool, plus compact `<tool_call>` formatting when external tools are present.
  */
 export function buildSystemPromptAppend(
   messages: OpenAIMessage[],
@@ -20,31 +21,25 @@ export function buildSystemPromptAppend(
     .map((m) => extractTextContent(m.content).trim())
     .filter(Boolean);
 
-  const blocks: string[] = [];
-
-  blocks.push(`<system_override>
-CRITICAL RUNTIME RULES:
-1. You are operating as a pure stateless/session-bridged inference engine behind an OpenAI API Gateway.
-2. ALL native/built-in Antigravity CLI tools (such as read_file, write_file, edit_file, run_command, grep, glob, browser, etc.) are STRICTLY PROHIBITED and sandboxed in an empty read-only directory. NEVER invoke any native/built-in tool under any circumstance.
-3. Answer directly in plain text unless external tools are provided in <available_tools> below.`);
+  const blocks: string[] = [
+    "Never call built-in tools (such as manage_task).",
+  ];
 
   if (tools && tools.length > 0 && toolChoice !== "none") {
     const toolDefsJson = JSON.stringify(
       tools.map((t) => ({
         name: t.function.name,
-        description: t.function.description || "",
+        ...(t.function.description ? { description: t.function.description } : {}),
         parameters: t.function.parameters || { type: "object", properties: {} },
-      })),
-      null,
-      2
+      }))
     );
 
-    let choiceInstruction =
-      "4. When you need to call one or more external tools from <available_tools>, you MUST emit raw XML <tool_call> block(s) in your text response using THIS EXACT FORMAT (valid JSON inside <tool_call></tool_call>, NO markdown code fences inside the tag):\n<tool_call>\n{\"name\": \"exact_tool_name\", \"arguments\": {\"key\": \"value\"}}\n</tool_call>\n5. If calling multiple distinct tools in parallel, output multiple <tool_call>...</tool_call> blocks back-to-back.\n6. After outputting <tool_call>...</tool_call>, end your response and wait for <tool_response>. NEVER output meta-commentary about stopping or waiting, NEVER critique or apologize for your own formatting or trailing characters, and NEVER repeat the same <tool_call> block more than once in a turn.";
+    let toolProtocol =
+      'To call external tools from <available_tools>, emit raw XML (valid JSON inside, no code fences):\n<tool_call>\n{"name":"tool_name","arguments":{}}\n</tool_call>\nFor parallel calls, emit multiple <tool_call> blocks back-to-back. After <tool_call>, stop immediately and wait for <tool_response> without commentary or repetition.';
 
     if (toolChoice === "required") {
-      choiceInstruction +=
-        "\n7. IMPORTANT: tool_choice is set to 'required'. You MUST output at least one <tool_call>...</tool_call> block in this turn.";
+      toolProtocol +=
+        "\ntool_choice is 'required': you MUST emit at least one <tool_call> block in this turn.";
     } else if (
       typeof toolChoice === "object" &&
       toolChoice !== null &&
@@ -52,17 +47,15 @@ CRITICAL RUNTIME RULES:
       typeof (toolChoice as { function?: { name?: string } }).function?.name === "string"
     ) {
       const forcedName = (toolChoice as { function: { name: string } }).function.name;
-      choiceInstruction += `\n7. IMPORTANT: You MUST call the tool named "${forcedName}" using a <tool_call>...</tool_call> block in this turn.`;
+      toolProtocol += `\nYou MUST call "${forcedName}" using a <tool_call> block in this turn.`;
     }
 
-    blocks.push(choiceInstruction);
-    blocks.push(`</system_override>\n\n<available_tools>\n${toolDefsJson}\n</available_tools>`);
-  } else {
-    blocks.push(`</system_override>`);
+    blocks.push(toolProtocol);
+    blocks.push(`<available_tools>\n${toolDefsJson}\n</available_tools>`);
   }
 
   if (systemMessages.length > 0) {
-    blocks.push(`<developer_instructions>\n${systemMessages.join("\n\n")}\n</developer_instructions>`);
+    blocks.push(systemMessages.join("\n\n"));
   }
 
   return blocks.join("\n\n");

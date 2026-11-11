@@ -31,9 +31,9 @@ linux.do里的一个项目——[dsh-plugin-bundle](https://github.com/lili-luo/
 
 ## 主要特性
 
-1. **原生 ACP 协议中转+隔离沙箱**
-   * 每个常驻 Worker 进程通过 `agy acp --sandbox --include-default-customizations=false` 启动，自动克隆轻量登录态至独立目录（`~/.gemini/agy2api-worker-{id}`），并将工作目录锁定在只读空沙箱（Jail Directory）。
-   * 底层拦截 `session/request_permission` 请求，**阻碍 `agy` 拉起CLI的内置终端或内置浏览器**，强制模型完全使用外部客户端传入的 `tools`（包括外部 MCP、Web Search、Playwright 等）。
+1. **原生 ACP 协议中转+极简隔离沙箱**
+   * 每个常驻 Worker 进程通过独立 `--gemini-dir`（`~/.gemini/agy2api-worker-{id}`）与自定义极简 Agent（`excludeDefaultComponents: true`）启动，彻底剥离 `agy` 默认人设与内置文件/终端/浏览器工具 Schema（单轮基础上下文从 `~7,000` tokens 精简至 `~400` tokens），同时隔离宿主全局 `~/.gemini/config` 干扰，并将工作目录锁定在只读空沙箱（Jail Directory）。
+   * 底层通过 `PreToolUse` 生命周期钩子与 `session/request_permission` 双重硬阻断，**杜绝触发任何 `agy` CLI 内置工具（含残留控制面工具 `manage_task`）**，强制模型仅使用外部客户端传入的 `tools`（包括外部 MCP、Web Search、Playwright 等）。
 2. **会话缓存复用**
    * 自动对 OpenAI `messages` 历史前缀计算哈希链。在多轮对话或工具结果（`role: "tool"`）回传时自动命中已有 `sessionId`（`HASH HIT`），仅编译并发送新增的增量消息（Delta Prompt），使其可以一定程度不受agy cli+acp协议的影响，照常实现一定程度的缓存命中。
 3. **滑动窗口流式解析器**
@@ -139,11 +139,11 @@ npm run start:prod
 
 网关支持 `/v1/models` 自动枚举当前 `agy` 账号支持的所有模型，并提供了三种灵活的方式控制思考强度（`low` / `medium` / `high`）：
 
-1. **标准参数**：使用基础模型名（如 `gemini-3.8-flash`、`gemini-4-argon`、`claude-sonnet-5-5`），并在请求体中传入 OpenAI 标准字段 `reasoning_effort: "low" | "medium" | "high"`。
+1. **标准参数**：使用基础模型名（如 `gemini-4-carbon`、`gemini-4-argon`、`gemini-3.8-flash`、`claude-sonnet-5-5`），并在请求体中传入 OpenAI 标准字段 `reasoning_effort: "low" | "medium" | "high"`。
 2. **模型名后缀**：直接在客户端模型名中追加后缀，网关会自动解析并映射：
-   * 连字符写法：`gemini-4-argon-high`、`gemini-3.8-flash-low`
-   * 括号写法：`gemini-4-argon(high)`、`gemini-4-argon (low)`
-   * 冒号写法：`gemini-4-argon:high`
+   * 连字符写法：`gemini-4-carbon-high`、`gemini-4-argon-high`、`gemini-3.8-flash-low`
+   * 括号写法：`gemini-4-carbon(high)`、`gemini-4-argon (low)`
+   * 冒号写法：`gemini-4-carbon:high`、`gemini-4-argon:high`
 
 ### 环境变量与配置文件参考
 

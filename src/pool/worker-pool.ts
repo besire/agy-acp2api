@@ -21,6 +21,9 @@ interface QueuedWaiter {
 }
 
 const DEFAULT_FALLBACK_MODELS: AcpModelInfo[] = [
+  { modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)" },
+  { modelId: "gemini-4-carbon-medium", name: "Gemini 4 Carbon (Medium)" },
+  { modelId: "gemini-4-carbon-low", name: "Gemini 4 Carbon (Low)" },
   { modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)" },
   { modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
   { modelId: "gemini-4-argon-low", name: "Gemini 4 Argon (Low)" },

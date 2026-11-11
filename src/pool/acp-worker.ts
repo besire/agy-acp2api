@@ -78,7 +78,8 @@ export class AcpWorker {
       "acp",
       "--sandbox",
       "--include-default-customizations=false",
-      `--app-data-dir=${this.sandbox.relAppDataDir}`,
+      `--gemini-dir=${this.sandbox.absGeminiDir}`,
+      `--agent=${this.sandbox.agentName}`,
       `--cloud_code_endpoint=http://127.0.0.1:${snifferPort}`,
     ];
 

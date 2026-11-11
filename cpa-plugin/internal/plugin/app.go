@@ -498,6 +498,45 @@ func (a *App) handleModels() ([]byte, error) {
 	})
 }
 
+func stripThinkingSuffix(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return s
+	}
+	lower := strings.ToLower(s)
+	levels := []string{"low", "medium", "high", "minimal", "max", "xhigh"}
+
+	// Bracket syntax: e.g. gemini-4-carbon(high), gemini-4-carbon [low]
+	for _, pair := range [][2]string{{"(", ")"}, {"[", "]"}} {
+		if strings.HasSuffix(lower, pair[1]) {
+			if idx := strings.LastIndex(lower, pair[0]); idx > 0 {
+				inner := strings.TrimSpace(lower[idx+1 : len(lower)-1])
+				for _, lv := range levels {
+					if inner == lv {
+						return strings.TrimSpace(s[:idx])
+					}
+				}
+			}
+		}
+	}
+
+	// Delimiter syntax: e.g. gemini-4-carbon:high, gemini-4-carbon@low, gemini-4-carbon-high
+	for _, sep := range []string{":", "@", "/", "-"} {
+		if idx := strings.LastIndex(lower, sep); idx > 0 {
+			tail := strings.TrimSpace(lower[idx+1:])
+			for _, lv := range levels {
+				if sep == "-" && lv != "low" && lv != "medium" && lv != "high" {
+					continue
+				}
+				if tail == lv {
+					return strings.TrimSpace(s[:idx])
+				}
+			}
+		}
+	}
+	return s
+}
+
 func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 	var req ModelRouteRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -508,9 +547,11 @@ func (a *App) handleModelRoute(raw []byte) ([]byte, error) {
 		return OKEnvelope(ModelRouteResponse{Handled: false})
 	}
 
+	baseModel := stripThinkingSuffix(model)
+
 	a.mu.RLock()
 	enabled := a.cfg.Enabled
-	known := a.cachedModels[model]
+	known := a.cachedModels[model] || a.cachedModels[baseModel]
 	a.mu.RUnlock()
 
 	if !enabled {

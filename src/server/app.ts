@@ -335,8 +335,8 @@ export function createGatewayApp(pool: WorkerPool): Hono {
       const cachedWrite = acpUsage?.cachedWriteTokens ?? 0;
       const thoughtTokens = acpUsage?.thoughtTokens ?? 0;
       const totalPromptTokens = uncachedInput + cachedRead + cachedWrite;
-      const totalTokens =
-        totalPromptTokens + outputTokens + thoughtTokens;
+      // ACP `outputTokens` already includes `thoughtTokens` (matching OpenAI `completion_tokens`)
+      const totalTokens = totalPromptTokens + outputTokens;
 
       return {
         prompt_tokens: totalPromptTokens,
