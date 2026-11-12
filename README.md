@@ -135,6 +135,13 @@ npm run start:prod
 | **OpenAI v1 Base URL** | `http://127.0.0.1:8787/v1` | 填入各 AI 客户端 |
 | **默认 API Key** | `sk-agy2api-local-key` | 可在 Web 控制台「核心配置热更新」或环境变量中修改 |
 
+### 鉴权与安全
+
+* `/v1/*` 与管理接口 `/api/admin/*` 都需要 API Key，可放在 `Authorization: Bearer <key>` 或 `X-Agy2Api-Key: <key>` 请求头中。控制台首次打开时会弹窗要求输入，Key 只保存在当前浏览器的 `localStorage` 中，服务端不会在任何接口中回传它。
+* 管理接口只接受 `POST` / `DELETE` 修改状态，不存在可被跨站页面触发的 GET 写操作。
+* 监听回环地址（默认 `127.0.0.1`）时，只接受 `Host` 为 `127.0.0.1` / `localhost` / `[::1]` 的请求，以防 DNS rebinding；反向代理或容器场景可用 `AGY2API_ALLOWED_HOSTS` 追加主机名。
+* 监听非回环地址（如 `0.0.0.0`）时，若仍使用默认 API Key，网关会拒绝启动。
+
 ### 模型与思考强度（Reasoning Effort）调用方式
 
 网关支持 `/v1/models` 自动枚举当前 `agy` 账号支持的所有模型，并提供了三种灵活的方式控制思考强度（`low` / `medium` / `high`）：
@@ -147,18 +154,51 @@ npm run start:prod
 
 ### 环境变量与配置文件参考
 
-你可以通过环境变量或项目根目录下的 `settings.json`（可参考 [`settings.example.json`](./settings.example.json)）自定义初始配置：
+你可以通过环境变量或 `settings.json`（默认在启动目录下，可参考 [`settings.example.json`](./settings.example.json)）自定义初始配置。`settings.json` 中的值优先于环境变量：
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `AGY2API_HOST` | `127.0.0.1` | 监听地址（如需局域网访问可设为 `0.0.0.0`） |
+| `AGY2API_HOST` | `127.0.0.1` | 监听地址（设为 `0.0.0.0` 等非回环地址时必须修改默认 API Key） |
 | `AGY2API_PORT` | `8787` | 监听端口 |
-| `AGY2API_KEY` | `sk-agy2api-local-key` | Bearer 鉴权密钥 |
+| `AGY2API_KEY` | `sk-agy2api-local-key` | `/v1` 与管理接口的鉴权密钥 |
+| `AGY2API_ALLOWED_HOSTS` | 空 | 监听回环地址时额外允许的 `Host` 主机名，逗号分隔 |
+| `AGY2API_HOME` | 启动目录 | `settings.json` 与 `data/telemetry.db` 所在目录 |
+| `AGY_GEMINI_HOME` | `~/.gemini` | `agy` 登录凭据（`antigravity-cli/`）与 Worker 沙箱目录所在位置 |
 | `AGY_BIN` | `agy` | `agy` 可执行文件路径 |
 | `AGY_DEFAULT_MODEL` | `gemini-3.8-flash` | 未指定或模型不存在时的回退默认模型 |
 | `AGY_DEFAULT_THINKING_LEVEL` | `medium` | 默认思考强度 (`low` / `medium` / `high`) |
 | `AGY_MIN_WORKERS` | `1` | 常驻热进程池最小 Worker 数量 |
 | `AGY_MAX_WORKERS` | `2` | 最大并发 Worker 数量（建议保持 $\le 2$ 以防上游并发风控） |
+| `AGY_MAX_SESSIONS_PER_WORKER` | `16` | 每个 Worker 最多保留的 ACP 会话数，超出时关闭最久未用的会话 |
+| `AGY_SESSION_TTL_MS` | `600000` | 会话空闲超过该时长后真正关闭（`session/close`）并失去缓存复用 |
+| `AGY_WORKER_IDLE_TTL_MS` | `180000` | 超出 `minWorkers` 的扩容 Worker 空闲多久后回收 |
+| `AGY_REQUEST_TIMEOUT_MS` | `300000` | 单次请求超时；超时后会向上游发送 `session/cancel` |
+
+<details>
+<summary>进阶调优（一般无需修改）</summary>
+
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `AGY_RESPAWN_BASE_DELAY_MS` | `1000` | Worker 启动失败或很快崩溃后的首次重启等待，之后每次失败翻倍 |
+| `AGY_RESPAWN_MAX_DELAY_MS` | `60000` | 重启等待上限 |
+| `AGY_WORKER_STABLE_UPTIME_MS` | `30000` | Worker 存活超过该时长即视为稳定，重启退避清零 |
+| `AGY_POOL_SWEEP_INTERVAL_MS` | `10000` | 回收空闲 Worker、关闭过期会话的巡检间隔 |
+
+</details>
+
+`agy` 未安装或尚未登录时，网关仍会启动并在后台按退避策略重试；此时 `/v1` 请求返回 `503`，错误信息与控制台中会显示 `agy` 的退出码和 stderr 末尾内容，便于排查。
+
+---
+
+## 测试
+
+```bash
+npm run typecheck   # 源码与测试的类型检查
+npm test            # 单元测试 + 黑盒测试，使用模拟的 agy，不需要账号
+npm run test:live   # 连接真实 agy 的端到端测试（消耗账号额度）
+```
+
+黑盒测试（`test/blackbox/`）把网关当作独立进程启动，只通过 HTTP 接口和模拟 agy（[`test/fixtures/fake-agy.mjs`](./test/fixtures/fake-agy.mjs)）的 ACP 消息日志观察行为，不会读写真实的 `~/.gemini`。设置 `AGY2API_TEST_SERVER_CMD` 即可让同一套测试运行在其他实现上。
 
 ---
 
