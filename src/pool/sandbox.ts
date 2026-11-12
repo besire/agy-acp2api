@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { runtimePaths } from "../config.js";
 
 export const GATEWAY_AGENT_NAME = "gateway";
 
@@ -42,7 +43,7 @@ const EXCLUDED_WORKER_DIRS = new Set([
  * file-based token storage (`cliFileTokenStorage`) inside `antigravity-cli`.
  */
 export function syncWorkerSandboxAuth(absAppDataDir: string): void {
-  const geminiBaseDir = path.join(os.homedir(), ".gemini");
+  const geminiBaseDir = runtimePaths.geminiBaseDir;
   const primaryCliDir = path.join(geminiBaseDir, "antigravity-cli");
   if (!fs.existsSync(primaryCliDir)) return;
 
@@ -141,7 +142,7 @@ function writeWorkerGatewayCustomizations(absGeminiDir: string): void {
  * 2. An empty read-only temporary directory (`jailCwd`) used as `cwd` for `session/new`.
  */
 export function createWorkerSandbox(workerId: string): WorkerSandboxEnv {
-  const geminiBaseDir = path.join(os.homedir(), ".gemini");
+  const geminiBaseDir = runtimePaths.geminiBaseDir;
 
   const relAppDataDir = `agy2api-worker-${workerId}`;
   const absGeminiDir = path.join(geminiBaseDir, relAppDataDir);
@@ -189,7 +190,7 @@ export function cleanupWorkerSandbox(sandbox: WorkerSandboxEnv): void {
  */
 export function sweepStaleSandboxes(): void {
   try {
-    const geminiBaseDir = path.join(os.homedir(), ".gemini");
+    const geminiBaseDir = runtimePaths.geminiBaseDir;
     if (fs.existsSync(geminiBaseDir)) {
       for (const entry of fs.readdirSync(geminiBaseDir)) {
         if (entry.startsWith("agy2api-worker-")) {

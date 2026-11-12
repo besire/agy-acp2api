@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { ThinkingLevel } from "../config.js";
+import { runtimePaths, ThinkingLevel } from "../config.js";
 
 export interface RequestTelemetryRecord {
   requestId: string;
@@ -53,8 +53,7 @@ export interface SessionTelemetryRecord {
   totalTtftMs: number;
 }
 
-const DEFAULT_DB_DIR = path.resolve(process.cwd(), "data");
-const DEFAULT_DB_PATH = path.join(DEFAULT_DB_DIR, "telemetry.db");
+const DEFAULT_DB_PATH = path.join(runtimePaths.dataDir, "telemetry.db");
 
 export class TelemetryStore {
   private db: DatabaseSync;

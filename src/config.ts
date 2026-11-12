@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export type ThinkingLevel = "low" | "medium" | "high";
@@ -13,24 +14,59 @@ export interface GatewayConfig {
   defaultThinkingLevel: ThinkingLevel;
   minWorkers: number;
   maxWorkers: number;
+  maxSessionsPerWorker: number;
   workerIdleTtlMs: number;
   sessionTtlMs: number;
   requestTimeoutMs: number;
   uiLayout: UiLayout;
 }
 
-const SETTINGS_FILE_PATH = path.resolve(process.cwd(), "settings.json");
+export const DEFAULT_API_KEY = "sk-agy2api-local-key";
+
+/**
+ * Filesystem locations resolved once at startup. Not editable from the dashboard.
+ * - `AGY2API_HOME`: where `settings.json` and `data/telemetry.db` live (default: cwd)
+ * - `AGY_GEMINI_HOME`: base dir holding `antigravity-cli/` auth and worker sandboxes (default: ~/.gemini)
+ * - `AGY2API_ALLOWED_HOSTS`: extra `Host` header names accepted while bound to loopback
+ */
+const appHome = path.resolve(process.env.AGY2API_HOME || process.cwd());
+
+export const runtimePaths = {
+  appHome,
+  settingsFile: path.join(appHome, "settings.json"),
+  dataDir: path.join(appHome, "data"),
+  geminiBaseDir: path.resolve(
+    process.env.AGY_GEMINI_HOME || path.join(os.homedir(), ".gemini")
+  ),
+};
+
+export const extraAllowedHosts: string[] = (process.env.AGY2API_ALLOWED_HOSTS || "")
+  .split(",")
+  .map((h) => h.trim().toLowerCase())
+  .filter(Boolean);
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
+}
+
+const SETTINGS_FILE_PATH = runtimePaths.settingsFile;
 
 const defaultConfig: GatewayConfig = {
   host: process.env.AGY2API_HOST || "127.0.0.1",
   port: parseInt(process.env.AGY2API_PORT || "8787", 10),
-  apiKey: process.env.AGY2API_KEY || "sk-agy2api-local-key",
+  apiKey: process.env.AGY2API_KEY || DEFAULT_API_KEY,
   agyBin: process.env.AGY_BIN || "agy",
   defaultModel: process.env.AGY_DEFAULT_MODEL || "gemini-3.8-flash",
   defaultThinkingLevel:
     (process.env.AGY_DEFAULT_THINKING_LEVEL as ThinkingLevel) || "medium",
   minWorkers: parseInt(process.env.AGY_MIN_WORKERS || "1", 10),
-  maxWorkers: parseInt(process.env.AGY_MAX_WORKERS || "6", 10),
+  maxWorkers: parseInt(process.env.AGY_MAX_WORKERS || "2", 10),
+  maxSessionsPerWorker: parseInt(
+    process.env.AGY_MAX_SESSIONS_PER_WORKER || "16",
+    10
+  ),
   workerIdleTtlMs: parseInt(
     process.env.AGY_WORKER_IDLE_TTL_MS || "180000",
     10
@@ -92,6 +128,15 @@ export function updateGatewayConfig(
     );
   }
   if (
+    typeof patch.maxSessionsPerWorker === "number" &&
+    patch.maxSessionsPerWorker >= 1
+  ) {
+    config.maxSessionsPerWorker = Math.min(
+      256,
+      Math.floor(patch.maxSessionsPerWorker)
+    );
+  }
+  if (
     typeof patch.workerIdleTtlMs === "number" &&
     patch.workerIdleTtlMs >= 5000
   ) {
@@ -118,6 +163,7 @@ export function updateGatewayConfig(
       defaultThinkingLevel: config.defaultThinkingLevel,
       minWorkers: config.minWorkers,
       maxWorkers: config.maxWorkers,
+      maxSessionsPerWorker: config.maxSessionsPerWorker,
       workerIdleTtlMs: config.workerIdleTtlMs,
       sessionTtlMs: config.sessionTtlMs,
       requestTimeoutMs: config.requestTimeoutMs,
@@ -139,4 +185,14 @@ export function updateGatewayConfig(
   }
 
   return { ...config };
+}
+
+/**
+ * Config as exposed over HTTP: never echoes the API key back.
+ */
+export function publicConfig(): Omit<GatewayConfig, "apiKey"> & {
+  apiKeyIsDefault: boolean;
+} {
+  const { apiKey, ...rest } = config;
+  return { ...rest, apiKeyIsDefault: apiKey === DEFAULT_API_KEY };
 }
