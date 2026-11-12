@@ -5,6 +5,7 @@ import { config } from "../config.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
   AcpConfigOption,
+  AcpContentBlock,
   AcpInitializeResult,
   AcpModelInfo,
   AcpPromptResult,
@@ -275,7 +276,7 @@ export class AcpWorker {
    */
   public async runPrompt(
     sessionId: string,
-    promptText: string,
+    prompt: AcpContentBlock[],
     acpModelId: string,
     callbacks: PromptStreamCallbacks,
     abortSignal?: AbortSignal
@@ -323,7 +324,7 @@ export class AcpWorker {
         "session/prompt",
         {
           sessionId,
-          prompt: [{ type: "text", text: promptText }],
+          prompt,
         },
         config.requestTimeoutMs
       );

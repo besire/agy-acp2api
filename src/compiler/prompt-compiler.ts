@@ -1,8 +1,92 @@
-import { ChatMessage, textOf, ToolChoice, ToolDefinition } from "../core/chat.js";
+import {
+  ChatMessage,
+  ContentPart,
+  textOf,
+  ToolChoice,
+  ToolDefinition,
+} from "../core/chat.js";
+import { AcpContentBlock } from "../types/acp.js";
+
+export interface CompileOptions {
+  /** The agent accepts image blocks; otherwise images become a text placeholder. */
+  images?: boolean;
+}
 
 export interface CompiledContext {
   systemPromptAppend: string;
-  promptText: string;
+  prompt: AcpContentBlock[];
+}
+
+export const IMAGE_PLACEHOLDER = "[image omitted]";
+
+type Segment = string | Extract<AcpContentBlock, { type: "image" }>;
+
+/** Accumulates prompt segments, merging adjacent text so a text-only prompt is one block. */
+class PromptBuilder {
+  private readonly blocks: AcpContentBlock[] = [];
+
+  push(...segments: Segment[]): this {
+    for (const segment of segments) {
+      if (typeof segment !== "string") {
+        this.blocks.push(segment);
+        continue;
+      }
+      if (!segment) continue;
+      const last = this.blocks[this.blocks.length - 1];
+      if (last?.type === "text") last.text += segment;
+      else this.blocks.push({ type: "text", text: segment });
+    }
+    return this;
+  }
+
+  build(): AcpContentBlock[] {
+    return this.blocks.length > 0 ? this.blocks : [{ type: "text", text: "" }];
+  }
+}
+
+/**
+ * Content as prompt segments: parts joined by newlines like `textOf`, images inline as blocks
+ * (only inlined images; anything else is a placeholder). With `trim`, the text ends are trimmed
+ * as `textOf(...).trim()` would.
+ */
+function contentSegments(content: ContentPart[], opts: CompileOptions, trim: boolean): Segment[] {
+  const segments: Segment[] = [];
+  content.forEach((part, i) => {
+    if (i > 0) segments.push("\n");
+    if (part.type === "text") {
+      segments.push(part.text);
+    } else if (opts.images && part.data && part.mimeType) {
+      segments.push({
+        type: "image",
+        mimeType: part.mimeType,
+        data: part.data,
+        ...(part.url ? { uri: part.url } : {}),
+      });
+    } else {
+      segments.push(IMAGE_PLACEHOLDER);
+    }
+  });
+  const joined = joinText(segments);
+  if (!trim) return joined;
+
+  const last = joined.length - 1;
+  return joined.map((s, i) => {
+    if (typeof s !== "string") return s;
+    let text = s;
+    if (i === 0) text = text.trimStart();
+    if (i === last) text = text.trimEnd();
+    return text;
+  });
+}
+
+function joinText(segments: Segment[]): Segment[] {
+  const out: Segment[] = [];
+  for (const s of segments) {
+    const prev = out[out.length - 1];
+    if (typeof s === "string" && typeof prev === "string") out[out.length - 1] = prev + s;
+    else out.push(s);
+  }
+  return out;
 }
 
 /**
@@ -55,12 +139,12 @@ export function buildSystemPromptAppend(
 }
 
 /**
- * Serializes a single non-system message into a clear transcript block.
+ * Serializes a single non-system message into transcript segments.
  */
-function serializeSingleMessage(msg: ChatMessage): string {
-  const text = textOf(msg.content).trim();
-
+function serializeSingleMessage(msg: ChatMessage, opts: CompileOptions): Segment[] {
   if (msg.role === "assistant") {
+    // The model's own earlier turns are replayed as text only
+    const text = textOf(msg.content).trim();
     const parts: string[] = [];
     if (text) {
       // Strip any historical post-tool_call self-correction hallucinations from polluted transcripts
@@ -86,16 +170,17 @@ function serializeSingleMessage(msg: ChatMessage): string {
         })}\n</tool_call>`
       );
     }
-    return parts.join("\n");
+    return [parts.join("\n")];
   }
 
+  const body = contentSegments(msg.content, opts, true);
   if (msg.role === "tool") {
     const idAttr = msg.toolCallId ? ` id="${msg.toolCallId}"` : "";
     const nameAttr = msg.name ? ` name="${msg.name}"` : "";
-    return `<tool_response${idAttr}${nameAttr}>\n${text}\n</tool_response>`;
+    return [`<tool_response${idAttr}${nameAttr}>\n`, ...body, "\n</tool_response>"];
   }
 
-  return text;
+  return body;
 }
 
 /**
@@ -104,41 +189,45 @@ function serializeSingleMessage(msg: ChatMessage): string {
 export function compileFullPrompt(
   messages: ChatMessage[],
   tools: ToolDefinition[] = [],
-  toolChoice?: ToolChoice
+  toolChoice?: ToolChoice,
+  opts: CompileOptions = {}
 ): CompiledContext {
   const systemPromptAppend = buildSystemPromptAppend(messages, tools, toolChoice);
   const nonSystem = messages.filter((m) => m.role !== "system");
+  const prompt = new PromptBuilder();
 
   // Single user message fast-path
   if (nonSystem.length === 1 && nonSystem[0].role === "user") {
     return {
       systemPromptAppend,
-      promptText: textOf(nonSystem[0].content),
+      prompt: prompt.push(...contentSegments(nonSystem[0].content, opts, false)).build(),
     };
   }
 
   // Multi-turn transcript serialization
-  const transcriptLines: string[] = [];
-  for (let i = 0; i < nonSystem.length; i++) {
-    const m = nonSystem[i];
-    const body = serializeSingleMessage(m);
-    if (i === nonSystem.length - 1 && m.role === "user") {
-      transcriptLines.push(body);
-    } else {
-      transcriptLines.push(`[${m.role.toUpperCase()}]\n${body}`);
+  nonSystem.forEach((m, i) => {
+    if (i > 0) prompt.push("\n\n");
+    if (!(i === nonSystem.length - 1 && m.role === "user")) {
+      prompt.push(`[${m.role.toUpperCase()}]\n`);
     }
-  }
+    prompt.push(...serializeSingleMessage(m, opts));
+  });
 
-  return {
-    systemPromptAppend,
-    promptText: transcriptLines.join("\n\n"),
-  };
+  return { systemPromptAppend, prompt: prompt.build() };
 }
 
 /**
  * Compiles ONLY the delta messages (e.g. `<tool_response>` or latest user message)
  * when a Session Prefix Hash hits an existing warm ACP session!
  */
-export function compileDeltaPrompt(deltaMessages: ChatMessage[]): string {
-  return deltaMessages.map((m) => serializeSingleMessage(m)).join("\n\n");
+export function compileDeltaPrompt(
+  deltaMessages: ChatMessage[],
+  opts: CompileOptions = {}
+): AcpContentBlock[] {
+  const prompt = new PromptBuilder();
+  deltaMessages.forEach((m, i) => {
+    if (i > 0) prompt.push("\n\n");
+    prompt.push(...serializeSingleMessage(m, opts));
+  });
+  return prompt.build();
 }

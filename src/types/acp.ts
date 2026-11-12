@@ -22,6 +22,11 @@ export interface JsonRpcNotification {
   params?: Record<string, unknown>;
 }
 
+/** Prompt content blocks sent in `session/prompt` (images need `promptCapabilities.image`). */
+export type AcpContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; data: string; uri?: string };
+
 /** What the agent declares in its `initialize` response. */
 export interface AcpInitializeResult {
   protocolVersion: number;

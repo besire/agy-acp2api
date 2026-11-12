@@ -17,9 +17,9 @@ describe("agent info", () => {
     const body = (await res.json()) as any;
     assert.equal(body.agent.protocolVersion, 1);
     assert.deepEqual(body.agent.agentCapabilities.promptCapabilities, {
-      image: false,
+      image: true,
       audio: false,
-      embeddedContext: false,
+      embeddedContext: true,
     });
   });
 });

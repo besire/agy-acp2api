@@ -148,7 +148,17 @@ npm run start:prod
 * 输入：字符串或输入项数组，支持 `message`（`input_text` / `output_text` / `input_image`）、`function_call`、`function_call_output`；`reasoning` 及联网搜索等托管工具项会被忽略，`item_reference` 返回 400。
 * 输出：思考内容作为 `reasoning` 项（summary）、正文作为 `message` 项、每个工具调用一个 `function_call` 项；流式按官方 `response.*` 事件序列输出，中途失败以 `response.failed` 结束。
 * 续接：每轮重发完整历史的客户端（如 `store: false`）与使用 `previous_response_id` 的客户端都能命中会话缓存，只把新增内容发给 `agy`。`previous_response_id` 依赖网关内存中的记录（1 小时、最多 500 条，重启即失效），`store: false` 的响应不会被记录。
-* 工具只支持 `type: "function"`；`custom`（自由格式）等其他类型会被忽略。暂不支持 `GET /v1/responses/{id}`。图片目前仍只保留文字部分，原生图片输入在后续版本中支持。
+* 工具只支持 `type: "function"`；`custom`（自由格式）等其他类型会被忽略。暂不支持 `GET /v1/responses/{id}`。
+
+### 图片输入
+
+两个接口都支持图片：Chat Completions 的 `image_url` 片段、Responses 的 `input_image`，以及工具结果里的图片。
+
+* `agy` 在握手时声明支持图片（`promptCapabilities.image`，可在控制台「运行」页查看）时，图片以 ACP 图片块原样交给模型，位置与原消息一致；不支持时替换为 `[image omitted]` 占位文字。
+* `data:` URL 直接使用；`http(s)` 链接由网关下载（单张不超过 20 MB、15 秒超时、最多 3 次跳转），格式支持 PNG / JPEG / GIF / WebP。
+* 为防止借网关探测内网，默认拒绝解析到本机、内网、链路本地地址的图片链接；确实需要时设置 `AGY2API_ALLOW_PRIVATE_IMAGE_URLS=1`。
+* 图片无法使用（下载失败、格式无法识别、base64 损坏、超过大小）时返回 `400`（`code: invalid_image`），不会影响 Worker。
+* 命中会话缓存时只发送新增消息里的图片，历史图片不会重复下载和上传。助手消息与系统消息里的图片不会发给模型。
 
 ### 鉴权与安全
 
@@ -177,6 +187,7 @@ npm run start:prod
 | `AGY2API_PORT` | `8787` | 监听端口 |
 | `AGY2API_KEY` | `sk-agy2api-local-key` | `/v1` 与管理接口的鉴权密钥 |
 | `AGY2API_ALLOWED_HOSTS` | 空 | 监听回环地址时额外允许的 `Host` 主机名，逗号分隔 |
+| `AGY2API_ALLOW_PRIVATE_IMAGE_URLS` | 关闭 | 允许下载指向本机 / 内网地址的图片链接 |
 | `AGY2API_HOME` | 启动目录 | `settings.json` 与 `data/telemetry.db` 所在目录 |
 | `AGY_GEMINI_HOME` | `~/.gemini` | `agy` 登录凭据（`antigravity-cli/`）与 Worker 沙箱目录所在位置 |
 | `AGY_BIN` | `agy` | `agy` 可执行文件路径 |

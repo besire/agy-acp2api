@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { serve } from "@hono/node-server";
 import { config } from "../../src/config.js";
 import {
@@ -209,6 +210,34 @@ function testUnifiedModelAndEffortResolverUnit() {
   console.log(
     "   -> Passed! SQLite WAL persistence, unified base models, suffix stripping & bounded cache hit rate (90.0%) verified."
   );
+}
+
+/** A solid-colour RGB PNG, so the live test needs no image fixtures. */
+function solidPng(size: number, rgb: [number, number, number]): Buffer {
+  const stride = size * 3 + 1;
+  const raw = Buffer.alloc(stride * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) raw.set(rgb, y * stride + 1 + x * 3);
+  }
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(zlib.crc32(body));
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: RGB
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", zlib.deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
 async function consumeSseStream(res: Response): Promise<{
@@ -503,6 +532,44 @@ async function runIntegrationTest() {
     assert.ok(
       overview.telemetry.recentRequests[1].actualModelVersion.includes("gemini-3.8-flash")
     );
+
+    console.log("\n8. [E2E Image Input via /v1/responses] Asking the model for the colour of a generated PNG...");
+    assert.equal(
+      overview.agent?.agentCapabilities?.promptCapabilities?.image,
+      true,
+      "agy should declare image prompt support"
+    );
+    const red = solidPng(64, [220, 20, 20]).toString("base64");
+    const imageRes = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash",
+        reasoning: { effort: "low" },
+        store: false,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "What colour fills this image? Answer with one English word." },
+              { type: "input_image", image_url: `data:image/png;base64,${red}` },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(imageRes.status, 200);
+    const imageJson = (await imageRes.json()) as any;
+    const answer = imageJson.output
+      .filter((item: any) => item.type === "message")
+      .map((item: any) => item.content[0].text)
+      .join("");
+    console.log("   -> Answer:", JSON.stringify(answer));
+    console.log("   -> Usage:", JSON.stringify(imageJson.usage));
+    assert.match(answer, /red/i);
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

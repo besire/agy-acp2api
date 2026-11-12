@@ -13,14 +13,16 @@ import {
   WorkerPool,
 } from "../pool/worker-pool.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
-import { AcpPromptResult } from "../types/acp.js";
+import { AcpContentBlock, AcpPromptResult } from "../types/acp.js";
 import {
+  ChatMessage,
   ChatRequest,
   GatewayError,
   TokenUsage,
   TurnEvent,
   TurnResult,
 } from "./chat.js";
+import { resolveImages } from "./images.js";
 
 export function errorMessage(err: unknown): string {
   return (err as { message?: string } | null)?.message || String(err);
@@ -62,14 +64,30 @@ export class ChatService {
   async prepare(req: ChatRequest, requestId: string): Promise<ChatTurn> {
     const target = resolveModelAndThinking(req, this.pool.getAvailableModels());
     let lease = await this.acquire(target, req);
-    let sessionId = lease.sessionId;
-    let promptText: string;
+    const reuse = lease.isReusedSession && lease.sessionId !== null;
+    const images =
+      lease.worker.agentInfo?.agentCapabilities?.promptCapabilities?.image === true;
 
+    // Images are only fetched for what is actually sent; a bad image is the client's fault
+    // and must not cost the worker
+    let outgoing: ChatMessage[];
     try {
-      if (lease.isReusedSession && sessionId) {
-        promptText = compileDeltaPrompt(lease.deltaMessages);
+      const pending = reuse ? lease.deltaMessages : req.messages;
+      outgoing = images ? await resolveImages(pending) : pending;
+    } catch (err) {
+      this.pool.releaseWorker(lease.worker);
+      throw err instanceof GatewayError
+        ? err
+        : new GatewayError(errorMessage(err), 400, "invalid_request_error");
+    }
+
+    let sessionId = lease.sessionId;
+    let prompt: AcpContentBlock[];
+    try {
+      if (reuse && sessionId) {
+        prompt = compileDeltaPrompt(outgoing, { images });
       } else {
-        const compiled = compileFullPrompt(req.messages, req.tools, req.toolChoice);
+        const compiled = compileFullPrompt(outgoing, req.tools, req.toolChoice, { images });
         try {
           sessionId = await lease.worker.createSession(
             compiled.systemPromptAppend,
@@ -97,7 +115,7 @@ export class ChatService {
           target.acpModelId,
           target.thinkingLevel
         );
-        promptText = compiled.promptText;
+        prompt = compiled.prompt;
       }
     } catch (err) {
       this.pool.terminateWorker(lease.worker.id);
@@ -108,7 +126,7 @@ export class ChatService {
       );
     }
 
-    return new ChatTurn(this.pool, requestId, req, target, lease, sessionId, promptText);
+    return new ChatTurn(this.pool, requestId, req, target, lease, sessionId, prompt);
   }
 
   private async acquire(
@@ -137,7 +155,7 @@ export class ChatTurn {
     readonly target: ResolvedModelTarget,
     private readonly lease: LeaseAcquisition,
     readonly sessionId: string,
-    private readonly promptText: string
+    private readonly prompt: AcpContentBlock[]
   ) {}
 
   get workerId(): string {
@@ -168,7 +186,7 @@ export class ChatTurn {
     try {
       const res = await worker.runPrompt(
         this.sessionId,
-        this.promptText,
+        this.prompt,
         target.acpModelId,
         {
           onActualModelDetected: (model) => onEvent({ type: "model", model }),

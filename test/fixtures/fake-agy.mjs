@@ -4,14 +4,16 @@
  *
  * Env:
  *   FAKE_AGY_LOG      JSONL file; every received message and lifecycle event is appended
- *   FAKE_AGY_CONTROL  JSON file read at boot, e.g. {"mode":"fail-start"}
+ *   FAKE_AGY_CONTROL  JSON file read at boot, e.g. {"mode":"fail-start"} or
+ *                     {"promptCapabilities":{"image":false}} (defaults mirror agy 1.5.6)
  *
  * Prompt directives (the last one in the prompt text wins):
  *   [[tool:NAME:{json args}]]  stream a <tool_call> block split across chunks
  *   [[hang]]                   never finish until session/cancel
  *   [[slow:MS]]                stream dots for MS milliseconds (cancellable)
  *   [[crash]]                  write to stderr and exit(3)
- *   (none)                     echo the prompt text back
+ *   (none)                     echo the prompt text back; image blocks are echoed as
+ *                              <image MIME BYTESB>
  */
 import fs from "node:fs";
 import readline from "node:readline";
@@ -76,9 +78,18 @@ async function runPrompt(id, params) {
   }
   s.cancelled = false;
 
-  const text = (params.prompt || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
+  const blocks = params.prompt || [];
+  const badImage = blocks.find(
+    (b) => b.type === "image" && (typeof b.mimeType !== "string" || typeof b.data !== "string")
+  );
+  if (badImage) {
+    send({ id, error: { code: -32602, message: "image blocks need mimeType and data" } });
+    return;
+  }
+  const text = blocks
+    .map((b) =>
+      b.type === "image" ? `<image ${b.mimeType} ${Buffer.from(b.data, "base64").length}B>` : b.text
+    )
     .join("\n");
   const { kind, arg } = lastDirective(text);
   const usage = {
@@ -162,7 +173,12 @@ function handle(msg) {
           protocolVersion: 1,
           agentCapabilities: {
             loadSession: false,
-            promptCapabilities: { image: false, audio: false, embeddedContext: false },
+            promptCapabilities: {
+              image: true,
+              audio: false,
+              embeddedContext: true,
+              ...readControl().promptCapabilities,
+            },
           },
         },
       });
