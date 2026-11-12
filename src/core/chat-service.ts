@@ -6,7 +6,7 @@ import {
   resolveModelAndThinking,
   ResolvedModelTarget,
 } from "../compiler/model-resolver.js";
-import { ToolCallStreamParser } from "../parser/stream-parser.js";
+import { ParserEvent, ToolCallStreamParser } from "../parser/stream-parser.js";
 import {
   LeaseAcquisition,
   PoolUnavailableError,
@@ -15,14 +15,18 @@ import {
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import { AcpContentBlock, AcpPromptResult } from "../types/acp.js";
 import {
+  AssistantMessage,
   ChatMessage,
   ChatRequest,
+  FinishReason,
   GatewayError,
   TokenUsage,
+  ToolCall,
   TurnEvent,
   TurnResult,
 } from "./chat.js";
 import { resolveImages } from "./images.js";
+import { StopSequenceFilter } from "./stop-sequences.js";
 
 export function errorMessage(err: unknown): string {
   return (err as { message?: string } | null)?.message || String(err);
@@ -48,6 +52,20 @@ function normalizeUsage(usage: AcpPromptResult["usage"]): TokenUsage {
   };
 }
 
+/** Maps an ACP stop reason onto the finish reason clients understand. */
+export function finishReasonFor(stopReason: string | undefined, toolCalls: number): FinishReason {
+  if (toolCalls > 0) return "tool_calls";
+  switch (stopReason) {
+    case "max_tokens":
+    case "max_turn_requests":
+      return "length";
+    case "refusal":
+      return "content_filter";
+    default:
+      return "stop";
+  }
+}
+
 /**
  * Protocol-independent chat pipeline: resolve model → lease worker → compile prompt →
  * open or reuse an ACP session (`prepare`), then run the prompt and turn its output into
@@ -69,13 +87,13 @@ export class ChatService {
       lease.worker.agentInfo?.agentCapabilities?.promptCapabilities?.image === true;
 
     // Images are only fetched for what is actually sent; a bad image is the client's fault
-    // and must not cost the worker
+    // and must not cost the worker or the warm session
     let outgoing: ChatMessage[];
     try {
       const pending = reuse ? lease.deltaMessages : req.messages;
       outgoing = images ? await resolveImages(pending) : pending;
     } catch (err) {
-      this.pool.releaseWorker(lease.worker);
+      this.pool.releaseUnusedLease(lease);
       throw err instanceof GatewayError
         ? err
         : new GatewayError(errorMessage(err), 400, "invalid_request_error");
@@ -96,13 +114,7 @@ export class ChatService {
         } catch {
           // If the worker had cached an unauthenticated state before login, recycle it and retry once
           this.pool.terminateWorker(lease.worker.id);
-          const retry = await this.pool.acquireForRequest(
-            target.baseModelId,
-            req.tools,
-            req.messages
-          );
-          // The retry always opens a new session, even if its lease matched a warm one
-          lease = { ...retry, sessionId: null, isReusedSession: false };
+          lease = { ...(await this.pool.acquireFresh(req.messages)), missReason: lease.missReason };
           sessionId = await lease.worker.createSession(
             compiled.systemPromptAppend,
             target.acpModelId
@@ -179,64 +191,112 @@ export class ChatTurn {
 
     const { worker } = this.lease;
     const { request, target } = this;
-    const parser = new ToolCallStreamParser(onEvent);
-    const externalToolNames = new Set(request.tools.map((t) => t.name));
+    const toolNames = request.tools.map((t) => t.name);
+
+    // What the client actually receives: text past a stop sequence and anything after it is not
+    const stop = request.stop?.length ? new StopSequenceFilter(request.stop) : null;
+    const cutShort = new AbortController();
+    let text = "";
+    const toolCalls: ToolCall[] = [];
+    const emitText = (visible: string | undefined) => {
+      if (!visible) return;
+      text += visible;
+      onEvent({ type: "text", text: visible });
+    };
+    const forward = (event: ParserEvent) => {
+      if (cutShort.signal.aborted) return;
+      if (event.type === "tool_call") {
+        emitText(stop?.flush());
+        toolCalls.push(event.call);
+        onEvent(event);
+        return;
+      }
+      emitText(stop ? stop.push(event.text) : event.text);
+      // Stop generating upstream too: the rest would only burn quota
+      if (stop?.stopped) cutShort.abort();
+    };
+    const parser = new ToolCallStreamParser(forward, toolNames);
     let reasoning = "";
+    let sent = false;
+    let intact = false;
 
     try {
+      if (signal?.aborted) {
+        throw new Error("The client went away before the prompt was sent");
+      }
+      sent = true;
       const res = await worker.runPrompt(
         this.sessionId,
         this.prompt,
         target.acpModelId,
         {
           onActualModelDetected: (model) => onEvent({ type: "model", model }),
-          onThoughtChunk: (text) => {
-            reasoning += text;
-            onEvent({ type: "thought", text });
+          onThoughtChunk: (chunk) => {
+            if (cutShort.signal.aborted) return;
+            reasoning += chunk;
+            onEvent({ type: "thought", text: chunk });
           },
-          onMessageChunk: (text) => parser.feed(text),
+          onMessageChunk: (chunk) => parser.feed(chunk),
           onNativeToolCall: (name, rawInput) => {
-            if (externalToolNames.has(name)) {
+            if (toolNames.includes(name)) {
               parser.injectDirectToolCall(name, rawInput);
             }
           },
         },
-        signal
+        signal ? AbortSignal.any([signal, cutShort.signal]) : cutShort.signal
       );
 
       if (res.actualModelVersion) {
         onEvent({ type: "model", model: res.actualModelVersion });
       }
-      const finishReason = parser.flush();
-      const message = parser.toAssistantMessage();
-      this.pool.sessionRegistry.registerTurnState(
-        target.baseModelId,
-        request.tools,
-        [...request.messages, message],
-        worker.id,
-        this.sessionId
-      );
+      parser.flush();
+      if (!cutShort.signal.aborted) emitText(stop?.flush());
+
+      const message: AssistantMessage = {
+        role: "assistant",
+        content: text ? [{ type: "text", text }] : [],
+        toolCalls,
+      };
+      // A cancelled or cut-short turn leaves upstream history the client never saw
+      intact = res.stopReason !== "cancelled" && !cutShort.signal.aborted;
+      if (intact) {
+        this.pool.sessionRegistry.registerTurnState(
+          target.baseModelId,
+          request.tools,
+          [...request.messages, message],
+          worker.id,
+          this.sessionId
+        );
+      }
 
       const result: TurnResult = {
         message,
         reasoning,
-        finishReason,
+        finishReason: cutShort.signal.aborted
+          ? "stop"
+          : finishReasonFor(res.stopReason, toolCalls.length),
         usage: normalizeUsage(res.usage),
         actualModel: res.actualModelVersion || target.baseModelId,
         ttftMs: res.ttftMs,
         durationMs: res.durationMs,
       };
-      this.record(result);
+      this.record(result, parser.parseFailures);
       return result;
     } catch (err) {
-      this.record(null, errorMessage(err));
+      this.record(null, parser.parseFailures, errorMessage(err));
       throw err;
     } finally {
-      this.pool.releaseWorker(worker);
+      if (!sent) {
+        // Nothing reached agy: a reused session is still good, a new one is only primed
+        this.pool.releaseUnusedLease(this.lease);
+      } else {
+        if (!intact) this.pool.discardSession(worker.id, this.sessionId);
+        this.pool.releaseWorker(worker);
+      }
     }
   }
 
-  private record(result: TurnResult | null, error?: string): void {
+  private record(result: TurnResult | null, toolParseFailures: number, error?: string): void {
     try {
       telemetryStore.recordCompletedRequest({
         requestId: this.requestId,
@@ -244,6 +304,7 @@ export class ChatTurn {
         sessionId: this.sessionId,
         workerId: this.workerId,
         sessionCache: this.sessionCache,
+        missReason: this.lease.isReusedSession ? null : (this.lease.missReason ?? null),
         requestedModel: this.target.requestedModel,
         resolvedBaseModel: this.target.baseModelId,
         thinkingLevel: this.target.thinkingLevel,
@@ -254,6 +315,7 @@ export class ChatTurn {
         stream: this.request.stream,
         finishReason: result?.finishReason ?? "error",
         toolCallsCount: result?.message.toolCalls.length ?? 0,
+        toolParseFailures,
         ...(result?.usage ?? NO_USAGE),
         status: result ? "success" : "error",
         ...(error !== undefined ? { errorMessage: error } : {}),

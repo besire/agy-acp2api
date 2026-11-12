@@ -696,15 +696,18 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return '<span class="chip mono ' + (big ? "lg " : "") + (t ? "t-warn" : "t-plain") + '" data-tip="' + (t ? "trial 路由" : "上游模型") + '">' +
       (t ? '<span class="ms">warning</span>' : "") + esc(m || "–") + "</span>";
   }
-  function sessChip(hit, sid) {
+  var MISS_REASONS = { new_conversation: "新对话", no_match: "历史不匹配", worker_busy: "原进程忙，等待超时" };
+  function missName(reason) { return MISS_REASONS[reason] || reason || ""; }
+  function sessChip(hit, sid, reason) {
     return hit
       ? '<span class="chip t-primary" data-tip="会话复用"><span class="ms">link</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>"
-      : '<span class="chip t-tertiary" data-tip="新会话"><span class="ms">fiber_new</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>";
+      : '<span class="chip t-tertiary" data-tip="' + esc("新会话" + (reason ? " · " + missName(reason) : "")) + '"><span class="ms">fiber_new</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>";
   }
   function finish(r) {
     if (r.status === "error") return '<span class="ms fill c-err" data-tip="' + esc(r.errorMessage || "error") + '">error</span>';
     if (r.finishReason === "tool_calls") return '<span class="chip t-warn" data-tip="工具调用"><span class="ms">build</span>' + r.toolCallsCount + "</span>";
     if (r.finishReason === "length") return '<span class="ms c-slow" data-tip="长度截断">content_cut</span>';
+    if (r.finishReason === "content_filter") return '<span class="ms c-err" data-tip="模型拒绝回答">block</span>';
     return '<span class="ms fill c-ok" data-tip="完成">check_circle</span>';
   }
   function ring(p, size, sw, color) {
@@ -789,6 +792,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       (p.startingWorkers ? '<span class="chip t-warn" data-tip="启动中"><span class="dot warn"></span>' + p.startingWorkers + "</span>" : "") +
       '<span class="grow"></span>' +
       '<span class="chip ' + (p.queuedRequests ? "t-err" : "t-plain") + '" data-tip="排队请求"><span class="ms">hourglass_top</span>' + p.queuedRequests + "</span>" +
+      (p.affinityWaiters ? '<span class="chip t-warn" data-tip="等待原会话进程空闲"><span class="ms">link</span>' + p.affinityWaiters + "</span>" : "") +
       '<span class="chip t-plain" data-tip="会话哈希"><span class="ms">tag</span>' + p.cachedSessionHashes + "</span>" +
       '<span class="chip t-plain" data-tip="常驻 – 上限"><span class="ms">width</span>' + d.config.minWorkers + "–" + d.config.maxWorkers + "</span>" +
       "</div>";
@@ -819,17 +823,19 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   function renderHome(d) {
     var s = d.telemetry.summary, reqs = d.telemetry.recentRequests, chrono = reqs.slice().reverse();
     var okRate = s.totalRequests ? (s.successfulRequests / s.totalRequests) * 100 : 0;
+    var misses = Object.keys(s.missReasons || {}).map(function (k) { return missName(k) + " " + num(s.missReasons[k]); });
     var html =
       kpi("bolt", "t-primary", "请求",
         '<span class="kpi-val">' + (s.totalRequests >= 10000 ? tok(s.totalRequests) : num(s.totalRequests)) + "</span>" + ring(okRate, 48, 5, "var(--success)"),
         '<span class="chip t-ok" data-tip="成功"><span class="ms">check</span>' + num(s.successfulRequests) + "</span>" +
-        '<span class="chip ' + (s.failedRequests ? "t-err" : "t-plain") + '" data-tip="失败"><span class="ms">close</span>' + num(s.failedRequests) + "</span>") +
+        '<span class="chip ' + (s.failedRequests ? "t-err" : "t-plain") + '" data-tip="失败"><span class="ms">close</span>' + num(s.failedRequests) + "</span>" +
+        (s.toolParseFailures ? '<span class="chip t-warn" data-tip="无法解析的工具调用"><span class="ms">build</span>' + num(s.toolParseFailures) + "</span>" : "")) +
       kpi("timer", "t-secondary", "平均 TTFT",
         '<span class="kpi-val ' + tone(s.avgTtftMs) + '">' + ms(s.avgTtftMs) + "</span>",
         '<div style="flex:1" data-tip="最近 30 次">' + spark(chrono.slice(-30).map(function (r) { return r.ttftMs || 0; })) + "</div>") +
       kpi("cached", "t-tertiary", "缓存命中",
         '<span class="kpi-val">' + pct(s.cloudCacheHitRate) + "</span>" + ring(s.cloudCacheHitRate, 48, 5),
-        '<span class="ms" data-tip="会话复用率" style="font-size:16px">link</span><div class="lin ok" style="flex:1"><i style="width:' + s.sessionHashHitRate + '%"></i></div><span class="mono">' + pct(s.sessionHashHitRate) + "</span>") +
+        '<span class="ms" data-tip="' + esc(["会话复用率"].concat(misses).join("\n")) + '" style="font-size:16px">link</span><div class="lin ok" style="flex:1"><i style="width:' + s.sessionHashHitRate + '%"></i></div><span class="mono">' + pct(s.sessionHashHitRate) + "</span>") +
       kpi("token", "t-ok", "Token",
         '<span class="kpi-val">' + tok(s.totalTokens) + "</span>",
         '<div style="flex:1" data-tip="' + esc("缓存 " + tok(s.totalCachedReadTokens) + "\n输入 " + tok(s.totalInputTokens + s.totalCachedWriteTokens) +
@@ -895,7 +901,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         rows.map(function (r) {
           return '<tr data-act="open-req" data-id="' + esc(r.requestId) + '">' +
             '<td class="mono muted">' + clock(r.timestamp) + "</td>" +
-            "<td>" + sessChip(r.sessionCache === "HIT", r.sessionId) + "</td>" +
+            "<td>" + sessChip(r.sessionCache === "HIT", r.sessionId, r.missReason) + "</td>" +
             '<td><span class="model">' + esc(r.resolvedBaseModel) + lv(r.thinkingLevel) + "</span></td>" +
             "<td>" + upChip(r.actualModelVersion) + "</td>" +
             '<td class="r mono ' + tone(r.ttftMs) + '">' + ms(r.ttftMs) + "</td>" +
@@ -1076,10 +1082,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         stack(tokParts(r), 12) + tokLegend(r) +
         '<div class="kv" style="margin-top:8px"><span>命中</span><span class="cachecell">' + ring(r.cacheHitRate, 22, 3) + '<span class="mono">' + pct(r.cacheHitRate) + "</span></span></div>") +
       sec("forum", "会话",
-        kv("会话", '<span data-act="open-sess" data-id="' + esc(r.sessionId) + '" style="cursor:pointer">' + sessChip(r.sessionCache === "HIT", r.sessionId) + "</span>") +
+        kv("会话", '<span data-act="open-sess" data-id="' + esc(r.sessionId) + '" style="cursor:pointer">' + sessChip(r.sessionCache === "HIT", r.sessionId, r.missReason) + "</span>") +
+        (r.sessionCache !== "HIT" && r.missReason ? kv("未复用", esc(missName(r.missReason))) : "") +
         kv("进程", '<span class="mono">' + esc(r.workerId) + "</span>") +
         kv("传输", '<span class="chip t-plain">' + (r.stream ? "SSE" : "JSON") + "</span>")) +
-      sec("flag", "结果", kv(esc(r.finishReason || "stop"), finish(r)) + (r.errorMessage ? '<div class="err-box">' + esc(r.errorMessage) + "</div>" : "")) +
+      sec("flag", "结果", kv(esc(r.finishReason || "stop"), finish(r)) +
+        (r.toolParseFailures ? kv("工具解析失败", '<span class="mono c-slow">' + r.toolParseFailures + "</span>") : "") +
+        (r.errorMessage ? '<div class="err-box">' + esc(r.errorMessage) + "</div>" : "")) +
       '<div class="mono muted" style="font-size:11px">' + esc(r.requestId) + "</div>";
   }
   function sessSheet(s, d) {

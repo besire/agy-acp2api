@@ -391,14 +391,32 @@ function outputItems(reasoning: string, message: AssistantMessage): OutputItem[]
   return items;
 }
 
+type ResponseStatus = "in_progress" | "completed" | "incomplete" | "failed";
+
+/** A turn cut short by the model's output limit or a refusal is `incomplete`, not `completed`. */
+function finalStatus(result: TurnResult): {
+  status: ResponseStatus;
+  incomplete_details: { reason: "max_output_tokens" | "content_filter" } | null;
+} {
+  switch (result.finishReason) {
+    case "length":
+      return { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } };
+    case "content_filter":
+      return { status: "incomplete", incomplete_details: { reason: "content_filter" } };
+    default:
+      return { status: "completed", incomplete_details: null };
+  }
+}
+
 function responseObject(
   ctx: ResponseContext<ResponsesState>,
   fields: {
-    status: "in_progress" | "completed" | "failed";
+    status: ResponseStatus;
     model: string;
     output: OutputItem[];
     usage?: ResponsesUsage;
     error?: { code: string; message: string };
+    incomplete_details?: { reason: string } | null;
   }
 ): JsonObject {
   return {
@@ -407,7 +425,7 @@ function responseObject(
     created_at: ctx.created,
     status: fields.status,
     error: fields.error ?? null,
-    incomplete_details: null,
+    incomplete_details: fields.incomplete_details ?? null,
     model: fields.model,
     output: fields.output,
     usage: fields.usage ?? null,
@@ -454,10 +472,14 @@ class ResponsesStreamEncoder implements ChatStreamEncoder {
 
   finish(result: TurnResult): SseFrame[] {
     this.model = result.actualModel;
+    const final = finalStatus(result);
     return [
       ...this.closeOpen(),
-      this.frame("response.completed", {
-        response: this.snapshot("completed", toResponsesUsage(result.usage)),
+      this.frame(`response.${final.status}`, {
+        response: {
+          ...this.snapshot(final.status, toResponsesUsage(result.usage)),
+          incomplete_details: final.incomplete_details,
+        },
       }),
     ];
   }
@@ -474,7 +496,7 @@ class ResponsesStreamEncoder implements ChatStreamEncoder {
     ];
   }
 
-  private snapshot(status: "in_progress" | "completed" | "failed", usage?: ResponsesUsage) {
+  private snapshot(status: ResponseStatus, usage?: ResponsesUsage) {
     return responseObject(this.ctx, { status, model: this.model, output: this.items, usage });
   }
 
@@ -591,7 +613,7 @@ export function createResponsesProtocol(
 
     encodeResponse(ctx, result) {
       return responseObject(ctx, {
-        status: "completed",
+        ...finalStatus(result),
         model: result.actualModel,
         output: outputItems(result.reasoning, result.message),
         usage: toResponsesUsage(result.usage),

@@ -69,6 +69,8 @@ export interface ChatRequest {
   messages: ChatMessage[];
   tools: ToolDefinition[];
   toolChoice?: ToolChoice;
+  /** Visible text ends before the first occurrence of any of these. */
+  stop?: string[];
   stream: boolean;
 }
 
@@ -80,7 +82,8 @@ export type TurnEvent =
   /** The upstream model actually answering, once it is known. */
   | { type: "model"; model: string };
 
-export type FinishReason = "stop" | "tool_calls";
+/** `length`: the model hit its output limit; `content_filter`: it refused. */
+export type FinishReason = "stop" | "tool_calls" | "length" | "content_filter";
 
 /** Token counts as reported by ACP; `inputTokens` excludes cached reads and writes. */
 export interface TokenUsage {

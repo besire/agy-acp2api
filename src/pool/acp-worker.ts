@@ -282,6 +282,10 @@ export class AcpWorker {
     abortSignal?: AbortSignal
   ): Promise<ExtendedPromptExecutionResult> {
     await this.ensureSessionModel(sessionId, acpModelId);
+    if (abortSignal?.aborted) {
+      // A cancel sent ahead of the prompt would be ignored and the whole turn would still run
+      throw new Error("Prompt aborted before it was sent");
+    }
 
     this.sniffer.resetTurnModel();
     const startTime = Date.now();
@@ -311,13 +315,7 @@ export class AcpWorker {
       this.sendNotification("session/cancel", { sessionId });
     };
 
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        onAbort();
-      } else {
-        abortSignal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       const result = await this.sendRpc<AcpPromptResult>(

@@ -122,8 +122,8 @@ export class SessionAffinityRegistry {
   }
 
   /**
-   * Scans backwards for the longest prefix ending in an assistant message
-   * that matches an existing session on a currently IDLE worker.
+   * Scans backwards for the longest prefix ending in an assistant message that is the current
+   * head of a session accepted by `isWorkerAvailable`.
    */
   public findBestMatchingPrefix(
     baseModelId: string,
@@ -154,6 +154,20 @@ export class SessionAffinityRegistry {
     return null;
   }
 
+  /**
+   * Takes a matched session off the registry before a prompt is sent to it: its history is about
+   * to grow, so no other request may extend the old head (that would replay this turn to it).
+   */
+  public claim(entry: SessionAffinityEntry): void {
+    this.removeSession(entry.sessionId);
+  }
+
+  /** Undoes `claim` when the prompt was never sent. */
+  public restore(entry: SessionAffinityEntry): void {
+    this.entries.set(entry.hash, { ...entry, updatedAt: Date.now() });
+  }
+
+  /** Records the session's new head; older heads of the same session no longer match. */
   public registerTurnState(
     baseModelId: string,
     tools: ToolDefinition[],
@@ -166,6 +180,7 @@ export class SessionAffinityRegistry {
       tools,
       fullMessagesWithReply
     );
+    this.removeSession(sessionId);
     this.entries.set(hash, {
       hash,
       workerId,

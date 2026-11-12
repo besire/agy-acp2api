@@ -2,7 +2,11 @@ import "../helpers/isolate-env.js";
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { ToolCall } from "../../src/core/chat.js";
-import { ParserEvent, ToolCallStreamParser } from "../../src/parser/stream-parser.js";
+import {
+  matchToolName,
+  ParserEvent,
+  ToolCallStreamParser,
+} from "../../src/parser/stream-parser.js";
 
 function collector() {
   const text: string[] = [];
@@ -105,6 +109,36 @@ describe("ToolCallStreamParser", () => {
     assert.equal(tools.length, 1);
     assert.equal(tools[0].arguments, '{"q":"z"}');
     assert.equal(finish, "tool_calls");
+  });
+
+  test("counts unparseable blocks, closed or not", () => {
+    assert.equal(run(["<tool_call>nope</tool_call> text"]).parser.parseFailures, 1);
+    assert.equal(
+      run(['ok<tool_call>{"name":"x","arguments":{}}</tool_call><tool_call>bad</tool_call>']).parser
+        .parseFailures,
+      1
+    );
+    assert.equal(run(["<tool_call>{never closed"]).parser.parseFailures, 1);
+    assert.equal(run(['<tool_call>{"name":"x"}</tool_call>']).parser.parseFailures, 0);
+  });
+
+  test("maps slightly-off tool names onto the declared tools", () => {
+    const known = ["get_weather", "Search", "search_web"];
+    assert.equal(matchToolName("get_weather", known), "get_weather");
+    assert.equal(matchToolName("functions.get_weather", known), "get_weather");
+    assert.equal(matchToolName("default_api:get_weather", known), "get_weather");
+    assert.equal(matchToolName("GET_WEATHER", known), "get_weather");
+    assert.equal(matchToolName("search", known), "Search");
+    assert.equal(matchToolName("unknown_tool", known), "unknown_tool");
+    assert.equal(matchToolName("functions.x", []), "functions.x");
+
+    const { tools } = collector();
+    const parser = new ToolCallStreamParser((ev) => {
+      if (ev.type === "tool_call") tools.push({ index: ev.index, ...ev.call });
+    }, known);
+    parser.feed('<tool_call>{"name":"functions.search_web","arguments":{}}</tool_call>');
+    parser.flush();
+    assert.equal(tools[0].name, "search_web");
   });
 
   test("injectDirectToolCall goes through the same accumulation and dedupe", () => {

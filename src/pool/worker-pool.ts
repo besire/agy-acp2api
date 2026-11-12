@@ -1,10 +1,22 @@
 import crypto from "node:crypto";
 import { config, onConfigChange } from "../config.js";
-import { SessionAffinityRegistry } from "../compiler/session-hash.js";
+import {
+  SessionAffinityEntry,
+  SessionAffinityRegistry,
+} from "../compiler/session-hash.js";
 import { ChatMessage, ToolDefinition } from "../core/chat.js";
 import { AcpInitializeResult, AcpModelInfo } from "../types/acp.js";
 import { AcpWorker } from "./acp-worker.js";
 import { sweepStaleSandboxes } from "./sandbox.js";
+
+/**
+ * Why a request could not continue a warm session:
+ * - `new_conversation`: there is no earlier assistant turn to continue from
+ * - `no_match`: no live session's history matches (edited/regenerated history, expired or
+ *   closed session, gateway restart)
+ * - `worker_busy`: the matching session's worker stayed busy longer than the affinity wait
+ */
+export type MissReason = "new_conversation" | "no_match" | "worker_busy";
 
 export interface LeaseAcquisition {
   worker: AcpWorker;
@@ -12,6 +24,9 @@ export interface LeaseAcquisition {
   isReusedSession: boolean;
   deltaMessages: ChatMessage[];
   matchedPrefixLength: number;
+  /** Set on a reused session: the registry head this lease took over. */
+  claimed?: SessionAffinityEntry;
+  missReason?: MissReason;
 }
 
 export interface WorkerPoolOptions {
@@ -23,6 +38,11 @@ export interface WorkerPoolOptions {
   /** A worker that lived at least this long is considered healthy and resets the backoff. */
   stableUptimeMs?: number;
   queueTimeoutMs?: number;
+  /**
+   * How long a request waits for the busy worker that holds its warm session before giving up
+   * and replaying the whole history into a new session elsewhere. 0 never waits.
+   */
+  affinityWaitMs?: number;
 }
 
 /**
@@ -35,6 +55,17 @@ interface QueuedWaiter {
   resolve: (worker: AcpWorker) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+}
+
+/** Waits for one particular worker; resolves true once that worker is handed over BUSY. */
+interface AffinityWaiter {
+  resolve: (granted: boolean) => void;
+  timer: NodeJS.Timeout;
+}
+
+function envNonNegativeInt(name: string, fallback: number): number {
+  const v = parseInt(process.env[name] || "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
 const DEFAULT_FALLBACK_MODELS: AcpModelInfo[] = [
@@ -64,6 +95,7 @@ function envPositiveInt(name: string, fallback: number): number {
 export class WorkerPool {
   private workers = new Map<string, AcpWorker>();
   private waitQueue: QueuedWaiter[] = [];
+  private affinityWaiters = new Map<string, AffinityWaiter[]>();
   private sweepInterval: NodeJS.Timeout | null = null;
   private respawnTimer: NodeJS.Timeout | null = null;
   private consecutiveFailures = 0;
@@ -86,6 +118,8 @@ export class WorkerPool {
       stableUptimeMs:
         options.stableUptimeMs ?? envPositiveInt("AGY_WORKER_STABLE_UPTIME_MS", 30_000),
       queueTimeoutMs: options.queueTimeoutMs ?? 60_000,
+      affinityWaitMs:
+        options.affinityWaitMs ?? envNonNegativeInt("AGY2API_AFFINITY_WAIT_MS", 30_000),
     };
     this.sessionRegistry = new SessionAffinityRegistry(config.sessionTtlMs);
     onConfigChange((newCfg) => {
@@ -125,43 +159,65 @@ export class WorkerPool {
     tools: ToolDefinition[],
     messages: ChatMessage[]
   ): Promise<LeaseAcquisition> {
-    // 1. Check Session Prefix Hash affinity
-    const match = this.sessionRegistry.findBestMatchingPrefix(
-      baseModelId,
-      tools,
-      messages,
-      (workerId, sessionId) => {
-        const w = this.workers.get(workerId);
-        return Boolean(w && w.state === "IDLE" && w.hasSession(sessionId));
-      }
-    );
-
-    if (match) {
-      const worker = this.workers.get(match.entry.workerId)!;
-      worker.state = "BUSY";
-      worker.lastUsedAt = Date.now();
+    const findMatch = () =>
+      this.sessionRegistry.findBestMatchingPrefix(
+        baseModelId,
+        tools,
+        messages,
+        (workerId, sessionId) => {
+          const w = this.workers.get(workerId);
+          return Boolean(
+            w && (w.state === "IDLE" || w.state === "BUSY") && w.hasSession(sessionId)
+          );
+        }
+      );
+    const reuse = (worker: AcpWorker, match: NonNullable<ReturnType<typeof findMatch>>) => {
+      this.sessionRegistry.claim(match.entry);
       return {
         worker,
         sessionId: match.entry.sessionId,
         isReusedSession: true,
         deltaMessages: match.deltaMessages,
         matchedPrefixLength: match.matchedPrefixLength,
+        claimed: match.entry,
       };
+    };
+
+    // 1. Session affinity: continue the warm session whose head matches the history
+    let missReason: MissReason = messages.slice(1, -1).some((m) => m.role === "assistant")
+      ? "no_match"
+      : "new_conversation";
+    const match = findMatch();
+    if (match) {
+      const worker = this.workers.get(match.entry.workerId)!;
+      if (worker.state === "IDLE") {
+        this.reserve(worker);
+        return reuse(worker, match);
+      }
+
+      // Its worker is serving another session: waiting for it is usually far cheaper than
+      // replaying the whole history into a new session
+      missReason = "worker_busy";
+      if (await this.waitForWorker(worker, this.opts.affinityWaitMs)) {
+        const again = findMatch();
+        if (again && again.entry.workerId === worker.id) {
+          return reuse(worker, again);
+        }
+        return { ...this.freshLease(worker, messages), missReason: "no_match" };
+      }
     }
 
-    const freshLease = (worker: AcpWorker): LeaseAcquisition => ({
-      worker,
-      sessionId: null,
-      isReusedSession: false,
-      deltaMessages: messages,
-      matchedPrefixLength: 0,
-    });
+    return { ...(await this.acquireFresh(messages)), missReason };
+  }
+
+  /** Leases any worker for a new session, starting or waiting for one if needed. */
+  public async acquireFresh(messages: ChatMessage[]): Promise<LeaseAcquisition> {
+    const freshLease = (worker: AcpWorker) => this.freshLease(worker, messages);
 
     // 2. Cache Miss: find any IDLE worker
     for (const worker of this.workers.values()) {
       if (worker.state === "IDLE") {
-        worker.state = "BUSY";
-        worker.lastUsedAt = Date.now();
+        this.reserve(worker);
         return freshLease(worker);
       }
     }
@@ -187,6 +243,12 @@ export class WorkerPool {
     return freshLease(await this.enqueueWaiter(this.opts.queueTimeoutMs));
   }
 
+  /** Gives back a lease whose prompt was never sent, so a claimed session stays reusable. */
+  public releaseUnusedLease(lease: LeaseAcquisition): void {
+    if (lease.claimed) this.sessionRegistry.restore(lease.claimed);
+    this.releaseWorker(lease.worker);
+  }
+
   public releaseWorker(worker: AcpWorker): void {
     if (worker.state === "DEAD" || !this.workers.has(worker.id)) {
       this.ensureMinWorkers();
@@ -197,11 +259,19 @@ export class WorkerPool {
       this.cachedModels = worker.availableModels;
     }
 
+    // Requests waiting for this particular worker's sessions come first
+    const affinity = this.affinityWaiters.get(worker.id)?.shift();
+    if (affinity) {
+      clearTimeout(affinity.timer);
+      this.reserve(worker);
+      affinity.resolve(true);
+      return;
+    }
+
     const waiter = this.waitQueue.shift();
     if (waiter) {
       clearTimeout(waiter.timer);
-      worker.state = "BUSY";
-      worker.lastUsedAt = Date.now();
+      this.reserve(worker);
       waiter.resolve(worker);
       return;
     }
@@ -234,6 +304,7 @@ export class WorkerPool {
       busyWorkers: busy,
       startingWorkers: starting,
       queuedRequests: this.waitQueue.length,
+      affinityWaiters: Array.from(this.affinityWaiters.values()).reduce((n, w) => n + w.length, 0),
       cachedSessionHashes: this.sessionRegistry.size(),
       consecutiveSpawnFailures: this.consecutiveFailures,
       nextRespawnInMs: Math.max(0, this.nextSpawnAt - Date.now()),
@@ -274,6 +345,7 @@ export class WorkerPool {
     if (!w) return false;
     this.workers.delete(workerId);
     this.sessionRegistry.removeWorkerSessions(workerId);
+    this.dropAffinityWaiters(workerId);
     w.destroy();
     this.ensureMinWorkers();
     return true;
@@ -287,6 +359,15 @@ export class WorkerPool {
     if (!w || !w.hasSession(sessionId)) return false;
     await w.closeSession(sessionId);
     return true;
+  }
+
+  /**
+   * Drops a session whose upstream history no longer matches what the client saw (failed,
+   * cancelled or cut-short turn): it can never be continued, so close it now.
+   */
+  public discardSession(workerId: string, sessionId: string): void {
+    this.sessionRegistry.removeSession(sessionId);
+    void this.closeWorkerSession(workerId, sessionId).catch(() => {});
   }
 
   /**
@@ -328,6 +409,7 @@ export class WorkerPool {
     this.rejectAllWaiters(new Error("WorkerPool shutting down"));
 
     for (const worker of this.workers.values()) {
+      this.dropAffinityWaiters(worker.id);
       worker.destroy();
     }
     this.workers.clear();
@@ -372,8 +454,7 @@ export class WorkerPool {
     }
 
     if (reserve) {
-      worker.state = "BUSY";
-      worker.lastUsedAt = Date.now();
+      this.reserve(worker);
     } else {
       this.releaseWorker(worker);
     }
@@ -388,6 +469,7 @@ export class WorkerPool {
     if (this.workers.get(worker.id) !== worker) return;
     this.workers.delete(worker.id);
     this.sessionRegistry.removeWorkerSessions(worker.id);
+    this.dropAffinityWaiters(worker.id);
 
     const uptime = worker.readyAt === null ? 0 : Date.now() - worker.readyAt;
     if (uptime < this.opts.stableUptimeMs) {
@@ -449,6 +531,55 @@ export class WorkerPool {
     }
   }
 
+  private reserve(worker: AcpWorker): void {
+    worker.state = "BUSY";
+    worker.lastUsedAt = Date.now();
+  }
+
+  private freshLease(worker: AcpWorker, messages: ChatMessage[]): LeaseAcquisition {
+    return {
+      worker,
+      sessionId: null,
+      isReusedSession: false,
+      deltaMessages: messages,
+      matchedPrefixLength: 0,
+    };
+  }
+
+  /**
+   * Waits until `worker` is released and hands it over BUSY. False on timeout or when the
+   * worker leaves the pool first.
+   */
+  private waitForWorker(worker: AcpWorker, timeoutMs: number): Promise<boolean> {
+    if (timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const waiters = this.affinityWaiters.get(worker.id) ?? [];
+      this.affinityWaiters.set(worker.id, waiters);
+      const waiter: AffinityWaiter = {
+        resolve,
+        timer: setTimeout(() => {
+          const idx = waiters.indexOf(waiter);
+          if (idx !== -1) waiters.splice(idx, 1);
+          if (waiters.length === 0 && this.affinityWaiters.get(worker.id) === waiters) {
+            this.affinityWaiters.delete(worker.id);
+          }
+          resolve(false);
+        }, timeoutMs),
+      };
+      waiters.push(waiter);
+    });
+  }
+
+  private dropAffinityWaiters(workerId: string): void {
+    const waiters = this.affinityWaiters.get(workerId);
+    if (!waiters) return;
+    this.affinityWaiters.delete(workerId);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(false);
+    }
+  }
+
   private enqueueWaiter(timeoutMs: number): Promise<AcpWorker> {
     return new Promise<AcpWorker>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -486,6 +617,7 @@ export class WorkerPool {
       ) {
         this.workers.delete(id);
         this.sessionRegistry.removeWorkerSessions(id);
+        this.dropAffinityWaiters(id);
         worker.destroy();
       }
     }

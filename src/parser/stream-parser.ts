@@ -12,6 +12,20 @@ export interface ParsedToolPayload {
 
 export type ParserEvent = Extract<TurnEvent, { type: "text" | "tool_call" }>;
 
+const TOOL_NAME_PREFIX = /^(?:functions|default_api|tools?)[.:]/i;
+
+/**
+ * Maps a tool name as the model wrote it onto the request's tools: exact first, then without a
+ * `functions.` / `default_api:`-style namespace, then case-insensitively. Unknown names are kept.
+ */
+export function matchToolName(name: string, known: readonly string[]): string {
+  if (known.length === 0 || known.includes(name)) return name;
+  const bare = name.replace(TOOL_NAME_PREFIX, "");
+  if (known.includes(bare)) return bare;
+  const folded = known.filter((k) => k.toLowerCase() === bare.toLowerCase());
+  return folded.length === 1 ? folded[0] : name;
+}
+
 export class ToolCallStreamParser {
   private mode: "TEXT" | "BUFFERING_TOOL" = "TEXT";
   private buffer = "";
@@ -21,8 +35,17 @@ export class ToolCallStreamParser {
   private accumulatedContent = "";
   private accumulatedToolCalls: ToolCall[] = [];
 
-  /** `emit` receives visible text and completed tool calls as soon as they are known. */
-  constructor(private readonly emit: (event: ParserEvent) => void = () => {}) {}
+  /** `<tool_call>` blocks that could not be read as a call. */
+  public parseFailures = 0;
+
+  /**
+   * `emit` receives visible text and completed tool calls as soon as they are known.
+   * `toolNames` are the request's tools, used to repair slightly-off names.
+   */
+  constructor(
+    private readonly emit: (event: ParserEvent) => void = () => {},
+    private readonly toolNames: readonly string[] = []
+  ) {}
 
   /**
    * Feeds a new `agent_message_chunk` text delta into the sliding-window state machine.
@@ -87,9 +110,12 @@ export class ToolCallStreamParser {
           // must not swallow the rest of the reply
           this.hasSeenToolCall = true;
           this.emitParsedToolCall(parsed);
-        } else if (!this.hasSeenToolCall) {
-          // If completely unparseable and no valid tool call was seen, fall back to emitting raw text
-          this.emitText(`<tool_call>${rawInner}</tool_call>`);
+        } else {
+          this.parseFailures++;
+          if (!this.hasSeenToolCall) {
+            // If completely unparseable and no valid tool call was seen, fall back to emitting raw text
+            this.emitText(`<tool_call>${rawInner}</tool_call>`);
+          }
         }
       }
     }
@@ -120,8 +146,11 @@ export class ToolCallStreamParser {
         const salvaged = this.parseToolJson(this.buffer.trim());
         if (salvaged) {
           this.emitParsedToolCall(salvaged);
-        } else if (this.accumulatedToolCalls.length === 0) {
-          this.emitText(`<tool_call>${this.buffer}`);
+        } else {
+          this.parseFailures++;
+          if (this.accumulatedToolCalls.length === 0) {
+            this.emitText(`<tool_call>${this.buffer}`);
+          }
         }
         this.buffer = "";
         this.mode = "TEXT";
@@ -154,7 +183,8 @@ export class ToolCallStreamParser {
     this.emit({ type: "text", text });
   }
 
-  private emitParsedToolCall(parsed: ParsedToolPayload): void {
+  private emitParsedToolCall(payload: ParsedToolPayload): void {
+    const parsed = { ...payload, name: matchToolName(payload.name, this.toolNames) };
     const signature = `${parsed.name}::${parsed.arguments}`;
     if (this.seenToolSignatures.has(signature)) {
       // Deduplicate identical tool calls within the same turn (prevents self-correction retry loops)

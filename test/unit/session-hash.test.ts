@@ -123,4 +123,31 @@ describe("SessionAffinityRegistry", () => {
     reg2.removeWorkerSessions("w2");
     assert.equal(reg2.size(), 0);
   });
+
+  test("a session only matches at its latest head", () => {
+    const reg = new SessionAffinityRegistry();
+    const turn1 = history.slice(0, 3);
+    reg.registerTurnState("m", tools, turn1, "w1", "s1");
+    const turn2 = [...turn1, ...msgs([{ role: "user", content: "u2" }, { role: "assistant", content: "a2" }])];
+    reg.registerTurnState("m", tools, turn2, "w1", "s1");
+    assert.equal(reg.size(), 1);
+
+    // Continuing from the old head would replay u2 into a session that already has it
+    const fromOldHead = [...turn1, ...msgs([{ role: "user", content: "u2 again" }])];
+    assert.equal(reg.findBestMatchingPrefix("m", tools, fromOldHead, always), null);
+    const fromNewHead = [...turn2, ...msgs([{ role: "user", content: "u3" }])];
+    assert.equal(reg.findBestMatchingPrefix("m", tools, fromNewHead, always)?.entry.sessionId, "s1");
+  });
+
+  test("a claimed session cannot be matched again until restored", () => {
+    const reg = new SessionAffinityRegistry();
+    reg.registerTurnState("m", tools, history, "w1", "s1");
+    const next = [...history, ...msgs([{ role: "user", content: "more" }])];
+    const match = reg.findBestMatchingPrefix("m", tools, next, always)!;
+
+    reg.claim(match.entry);
+    assert.equal(reg.findBestMatchingPrefix("m", tools, next, always), null);
+    reg.restore(match.entry);
+    assert.equal(reg.findBestMatchingPrefix("m", tools, next, always)?.entry.sessionId, "s1");
+  });
 });

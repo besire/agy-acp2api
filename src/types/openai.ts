@@ -75,6 +75,7 @@ export interface OpenAIChatCompletionRequest {
   };
   temperature?: number;
   max_tokens?: number;
+  stop?: string | string[] | null;
 }
 
 export interface OpenAIUsageDetails {
@@ -103,7 +104,7 @@ export interface OpenAIChatCompletionChunk {
       reasoning_content?: string;
       tool_calls?: OpenAIToolCallDelta[];
     };
-    finish_reason: "stop" | "tool_calls" | "length" | null;
+    finish_reason: "stop" | "tool_calls" | "length" | "content_filter" | null;
   }>;
   usage?: OpenAIUsageDetails;
 }

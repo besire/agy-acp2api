@@ -200,6 +200,23 @@ function decodeToolChoice(raw: unknown): ToolChoice | undefined {
   return undefined;
 }
 
+/** `stop`: a string or up to 4 strings; empty strings are ignored. */
+function decodeStop(raw: unknown): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const list = typeof raw === "string" ? [raw] : raw;
+  if (!Array.isArray(list) || list.length > 4 || !list.every((s) => typeof s === "string")) {
+    throw new GatewayError(
+      "`stop` must be a string or an array of up to 4 strings",
+      400,
+      "invalid_request_error",
+      undefined,
+      "stop"
+    );
+  }
+  const stop = list.filter((s) => s.length > 0);
+  return stop.length > 0 ? stop : undefined;
+}
+
 /** Converts OpenAI chat messages into the neutral model; throws a 400 on malformed entries. */
 export function decodeMessages(messages: unknown[]): ChatMessage[] {
   return messages.map(decodeMessage);
@@ -218,6 +235,7 @@ export function decodeChatCompletionRequest(body: unknown): ChatRequest {
     messages: decodeMessages(body.messages),
     tools: decodeTools(body.tools),
     toolChoice: decodeToolChoice(body.tool_choice),
+    stop: decodeStop(body.stop),
     stream: Boolean(body.stream),
   };
 }

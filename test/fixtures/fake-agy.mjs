@@ -12,6 +12,7 @@
  *   [[hang]]                   never finish until session/cancel
  *   [[slow:MS]]                stream dots for MS milliseconds (cancellable)
  *   [[crash]]                  write to stderr and exit(3)
+ *   [[stop:REASON]]            echo, but end the turn with stopReason REASON
  *   (none)                     echo the prompt text back; image blocks are echoed as
  *                              <image MIME BYTESB>
  */
@@ -143,7 +144,8 @@ async function runPrompt(id, params) {
 
   let chunks;
   if (kind === "tool") {
-    const sep = arg.indexOf(":");
+    // Names may contain ':' themselves (`default_api:x`); the arguments always start with '{'
+    const sep = arg.search(/:(?=\{)/);
     const name = sep === -1 ? arg : arg.slice(0, sep);
     const args = sep === -1 ? "{}" : arg.slice(sep + 1);
     const block = `<tool_call>\n{"name":${JSON.stringify(name)},"arguments":${args}}\n</tool_call>`;
@@ -157,7 +159,8 @@ async function runPrompt(id, params) {
     chunks = [reply.slice(0, mid), reply.slice(mid)];
   }
 
-  finish((await emit(chunks)) ? "end_turn" : "cancelled");
+  const done = kind === "stop" ? arg : "end_turn";
+  finish((await emit(chunks)) ? done : "cancelled");
 }
 
 function handle(msg) {

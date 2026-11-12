@@ -9,6 +9,8 @@ export interface RequestTelemetryRecord {
   sessionId: string;
   workerId: string;
   sessionCache: "HIT" | "MISS";
+  /** Why a MISS could not continue a warm session (see `MissReason`); null on a HIT. */
+  missReason?: string | null;
   requestedModel: string;
   resolvedBaseModel: string;
   thinkingLevel: ThinkingLevel;
@@ -19,6 +21,8 @@ export interface RequestTelemetryRecord {
   stream: boolean;
   finishReason: string;
   toolCallsCount: number;
+  /** `<tool_call>` blocks in the reply that could not be parsed. */
+  toolParseFailures?: number;
   inputTokens: number;
   cachedReadTokens: number;
   cachedWriteTokens: number;
@@ -127,6 +131,21 @@ export class TelemetryStore {
       CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
     `);
 
+    // Columns added after the first release; older databases get them on startup
+    const requestColumns = new Set(
+      (this.db.prepare(`PRAGMA table_info(requests)`).all() as Array<{ name: string }>).map(
+        (c) => c.name
+      )
+    );
+    if (!requestColumns.has("miss_reason")) {
+      this.db.exec(`ALTER TABLE requests ADD COLUMN miss_reason TEXT`);
+    }
+    if (!requestColumns.has("tool_parse_failures")) {
+      this.db.exec(
+        `ALTER TABLE requests ADD COLUMN tool_parse_failures INTEGER NOT NULL DEFAULT 0`
+      );
+    }
+
     // Any sessions left ACTIVE from a previous process run are now CLOSED
     this.db.exec(`UPDATE sessions SET status = 'CLOSED' WHERE status = 'ACTIVE'`);
   }
@@ -209,8 +228,9 @@ export class TelemetryStore {
         requested_model, resolved_base_model, thinking_level, acp_model_id,
         actual_model_version, ttft_ms, duration_ms, stream, finish_reason,
         tool_calls_count, input_tokens, cached_read_tokens, cached_write_tokens,
-        output_tokens, thought_tokens, total_tokens, cache_hit_rate, status, error_message
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        output_tokens, thought_tokens, total_tokens, cache_hit_rate, status, error_message,
+        miss_reason, tool_parse_failures
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     insertReqStmt.run(
@@ -237,7 +257,9 @@ export class TelemetryStore {
       fullRec.totalTokens,
       fullRec.cacheHitRate,
       fullRec.status,
-      fullRec.errorMessage ?? null
+      fullRec.errorMessage ?? null,
+      fullRec.missReason ?? null,
+      fullRec.toolParseFailures ?? 0
     );
 
     // 3. Read current session totals and update atomically
@@ -325,11 +347,22 @@ export class TelemetryStore {
         COALESCE(SUM(cached_write_tokens), 0) AS totalCachedWriteTokens,
         COALESCE(SUM(output_tokens), 0) AS totalOutputTokens,
         COALESCE(SUM(thought_tokens), 0) AS totalThoughtTokens,
-        COALESCE(SUM(total_tokens), 0) AS totalTokens
+        COALESCE(SUM(total_tokens), 0) AS totalTokens,
+        COALESCE(SUM(tool_parse_failures), 0) AS toolParseFailures
       FROM requests
     `
       )
       .get() as Record<string, number>;
+
+    const missReasons: Record<string, number> = {};
+    for (const row of this.db
+      .prepare(
+        `SELECT miss_reason AS reason, COUNT(*) AS n FROM requests
+         WHERE session_cache = 'MISS' AND miss_reason IS NOT NULL GROUP BY miss_reason`
+      )
+      .all() as Array<{ reason: string; n: number }>) {
+      missReasons[row.reason] = Number(row.n);
+    }
 
     const totalRequests = Number(summaryRow?.totalRequests ?? 0);
     const successfulRequests = Number(summaryRow?.successfulRequests ?? 0);
@@ -405,6 +438,7 @@ export class TelemetryStore {
       sessionId: String(row.session_id),
       workerId: String(row.worker_id),
       sessionCache: row.session_cache as "HIT" | "MISS",
+      missReason: row.miss_reason == null ? null : String(row.miss_reason),
       requestedModel: String(row.requested_model),
       resolvedBaseModel: String(row.resolved_base_model),
       thinkingLevel: row.thinking_level as ThinkingLevel,
@@ -415,6 +449,7 @@ export class TelemetryStore {
       stream: Boolean(row.stream),
       finishReason: String(row.finish_reason),
       toolCallsCount: Number(row.tool_calls_count),
+      toolParseFailures: Number(row.tool_parse_failures ?? 0),
       inputTokens: Number(row.input_tokens),
       cachedReadTokens: Number(row.cached_read_tokens),
       cachedWriteTokens: Number(row.cached_write_tokens),
@@ -442,6 +477,8 @@ export class TelemetryStore {
         totalOutputTokens,
         totalThoughtTokens,
         totalTokens,
+        missReasons,
+        toolParseFailures: Number(summaryRow?.toolParseFailures ?? 0),
       },
       sessions,
       recentRequests,
