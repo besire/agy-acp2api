@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { jsonrepair } from "jsonrepair";
-import { OpenAIMessage, OpenAIToolCall, OpenAIToolCallDelta } from "../types/openai.js";
+import { AssistantMessage, FinishReason, ToolCall, TurnEvent } from "../core/chat.js";
 
 const OPEN_TAG_PREFIX = "<tool_call";
 const CLOSE_TAG = "</tool_call>";
@@ -10,24 +10,24 @@ export interface ParsedToolPayload {
   arguments: string;
 }
 
+export type ParserEvent = Extract<TurnEvent, { type: "text" | "tool_call" }>;
+
 export class ToolCallStreamParser {
   private mode: "TEXT" | "BUFFERING_TOOL" = "TEXT";
   private buffer = "";
-  private toolCallIndex = 0;
   private hasSeenToolCall = false;
   private seenToolSignatures = new Set<string>();
 
   private accumulatedContent = "";
-  private accumulatedToolCalls: OpenAIToolCall[] = [];
+  private accumulatedToolCalls: ToolCall[] = [];
+
+  /** `emit` receives visible text and completed tool calls as soon as they are known. */
+  constructor(private readonly emit: (event: ParserEvent) => void = () => {}) {}
 
   /**
    * Feeds a new `agent_message_chunk` text delta into the sliding-window state machine.
    */
-  public feed(
-    chunkText: string,
-    onContentDelta: (textDelta: string) => void,
-    onToolCallDelta: (toolDelta: OpenAIToolCallDelta) => void
-  ): void {
+  public feed(chunkText: string): void {
     if (!chunkText) return;
     this.buffer += chunkText;
 
@@ -40,9 +40,7 @@ export class ToolCallStreamParser {
           // once a tool call has started in this turn, discard any inter-tool or post-tool chatter.
           if (openIdx > 0) {
             if (!this.hasSeenToolCall) {
-              const normalText = this.buffer.slice(0, openIdx);
-              this.accumulatedContent += normalText;
-              onContentDelta(normalText);
+              this.emitText(this.buffer.slice(0, openIdx));
             }
             this.buffer = this.buffer.slice(openIdx);
           }
@@ -66,9 +64,7 @@ export class ToolCallStreamParser {
 
         if (safeEmitLen > 0) {
           if (!this.hasSeenToolCall) {
-            const safeText = this.buffer.slice(0, safeEmitLen);
-            this.accumulatedContent += safeText;
-            onContentDelta(safeText);
+            this.emitText(this.buffer.slice(0, safeEmitLen));
           }
           this.buffer = this.buffer.slice(safeEmitLen);
         }
@@ -90,12 +86,10 @@ export class ToolCallStreamParser {
           // Only a successfully parsed call switches off later chatter; an unparseable block
           // must not swallow the rest of the reply
           this.hasSeenToolCall = true;
-          this.emitParsedToolCall(parsed, onToolCallDelta);
+          this.emitParsedToolCall(parsed);
         } else if (!this.hasSeenToolCall) {
           // If completely unparseable and no valid tool call was seen, fall back to emitting raw text
-          const fallback = `<tool_call>${rawInner}</tool_call>`;
-          this.accumulatedContent += fallback;
-          onContentDelta(fallback);
+          this.emitText(`<tool_call>${rawInner}</tool_call>`);
         }
       }
     }
@@ -104,40 +98,30 @@ export class ToolCallStreamParser {
   /**
    * Allows external native tool call interception to inject a tool call directly.
    */
-  public injectDirectToolCall(
-    name: string,
-    args: unknown,
-    onToolCallDelta: (toolDelta: OpenAIToolCallDelta) => void
-  ): void {
+  public injectDirectToolCall(name: string, args: unknown): void {
     const argsStr =
       typeof args === "string" ? args : JSON.stringify(args ?? {});
-    this.emitParsedToolCall({ name, arguments: argsStr }, onToolCallDelta);
+    this.emitParsedToolCall({ name, arguments: argsStr });
   }
 
   /**
    * Called when ACP `session/prompt` finishes.
-   * Flushes any held-back characters or unclosed tool call buffer and returns the OpenAI `finish_reason`.
+   * Flushes any held-back characters or unclosed tool call buffer and returns the finish reason.
    */
-  public flush(
-    onContentDelta: (textDelta: string) => void,
-    onToolCallDelta: (toolDelta: OpenAIToolCallDelta) => void
-  ): "tool_calls" | "stop" {
+  public flush(): FinishReason {
     if (this.buffer.length > 0) {
       if (this.mode === "TEXT") {
         if (!this.hasSeenToolCall) {
-          this.accumulatedContent += this.buffer;
-          onContentDelta(this.buffer);
+          this.emitText(this.buffer);
         }
         this.buffer = "";
       } else if (this.mode === "BUFFERING_TOOL") {
         // Attempt salvage if model stopped before closing `</tool_call>`
         const salvaged = this.parseToolJson(this.buffer.trim());
         if (salvaged) {
-          this.emitParsedToolCall(salvaged, onToolCallDelta);
+          this.emitParsedToolCall(salvaged);
         } else if (this.accumulatedToolCalls.length === 0) {
-          const fallback = `<tool_call>${this.buffer}`;
-          this.accumulatedContent += fallback;
-          onContentDelta(fallback);
+          this.emitText(`<tool_call>${this.buffer}`);
         }
         this.buffer = "";
         this.mode = "TEXT";
@@ -148,28 +132,29 @@ export class ToolCallStreamParser {
   }
 
   /**
-   * Reconstructs the complete OpenAI assistant message for non-streaming responses
-   * and for registering the post-turn Session Prefix Hash.
+   * The complete reply, for non-streaming responses and for registering the post-turn
+   * Session Prefix Hash.
    */
-  public toAssistantMessage(): OpenAIMessage {
-    const msg: OpenAIMessage = {
+  public toAssistantMessage(): AssistantMessage {
+    return {
       role: "assistant",
-      content: this.accumulatedContent || (this.accumulatedToolCalls.length > 0 ? null : ""),
+      content: this.accumulatedContent
+        ? [{ type: "text", text: this.accumulatedContent }]
+        : [],
+      toolCalls: [...this.accumulatedToolCalls],
     };
-    if (this.accumulatedToolCalls.length > 0) {
-      msg.tool_calls = this.accumulatedToolCalls;
-    }
-    return msg;
   }
 
   public hasToolCalls(): boolean {
     return this.accumulatedToolCalls.length > 0;
   }
 
-  private emitParsedToolCall(
-    parsed: ParsedToolPayload,
-    onToolCallDelta: (toolDelta: OpenAIToolCallDelta) => void
-  ): void {
+  private emitText(text: string): void {
+    this.accumulatedContent += text;
+    this.emit({ type: "text", text });
+  }
+
+  private emitParsedToolCall(parsed: ParsedToolPayload): void {
     const signature = `${parsed.name}::${parsed.arguments}`;
     if (this.seenToolSignatures.has(signature)) {
       // Deduplicate identical tool calls within the same turn (prevents self-correction retry loops)
@@ -177,28 +162,14 @@ export class ToolCallStreamParser {
     }
     this.seenToolSignatures.add(signature);
 
-    const index = this.toolCallIndex++;
-    const id = `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
-
-    const toolCall: OpenAIToolCall = {
-      id,
-      type: "function",
-      function: {
-        name: parsed.name,
-        arguments: parsed.arguments,
-      },
+    const call: ToolCall = {
+      id: `call_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      name: parsed.name,
+      arguments: parsed.arguments,
     };
-    this.accumulatedToolCalls.push(toolCall);
-
-    onToolCallDelta({
-      index,
-      id,
-      type: "function",
-      function: {
-        name: parsed.name,
-        arguments: parsed.arguments,
-      },
-    });
+    const index = this.accumulatedToolCalls.length;
+    this.accumulatedToolCalls.push(call);
+    this.emit({ type: "tool_call", index, call });
   }
 
   private parseToolJson(raw: string): ParsedToolPayload | null {

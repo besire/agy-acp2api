@@ -1,5 +1,4 @@
-import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
-import { extractTextContent } from "./session-hash.js";
+import { ChatMessage, textOf, ToolChoice, ToolDefinition } from "../core/chat.js";
 
 export interface CompiledContext {
   systemPromptAppend: string;
@@ -12,25 +11,25 @@ export interface CompiledContext {
  * to suppress the residual `manage_task` control-plane tool, plus compact `<tool_call>` formatting when external tools are present.
  */
 export function buildSystemPromptAppend(
-  messages: OpenAIMessage[],
-  tools?: OpenAIToolDefinition[],
-  toolChoice?: unknown
+  messages: ChatMessage[],
+  tools: ToolDefinition[] = [],
+  toolChoice?: ToolChoice
 ): string {
   const systemMessages = messages
-    .filter((m) => m.role === "system" || m.role === "developer")
-    .map((m) => extractTextContent(m.content).trim())
+    .filter((m) => m.role === "system")
+    .map((m) => textOf(m.content).trim())
     .filter(Boolean);
 
   const blocks: string[] = [
     "Never call built-in tools (such as manage_task).",
   ];
 
-  if (tools && tools.length > 0 && toolChoice !== "none") {
+  if (tools.length > 0 && toolChoice !== "none") {
     const toolDefsJson = JSON.stringify(
       tools.map((t) => ({
-        name: t.function.name,
-        ...(t.function.description ? { description: t.function.description } : {}),
-        parameters: t.function.parameters || { type: "object", properties: {} },
+        name: t.name,
+        ...(t.description ? { description: t.description } : {}),
+        parameters: t.parameters || { type: "object", properties: {} },
       }))
     );
 
@@ -40,14 +39,8 @@ export function buildSystemPromptAppend(
     if (toolChoice === "required") {
       toolProtocol +=
         "\ntool_choice is 'required': you MUST emit at least one <tool_call> block in this turn.";
-    } else if (
-      typeof toolChoice === "object" &&
-      toolChoice !== null &&
-      "function" in toolChoice &&
-      typeof (toolChoice as { function?: { name?: string } }).function?.name === "string"
-    ) {
-      const forcedName = (toolChoice as { function: { name: string } }).function.name;
-      toolProtocol += `\nYou MUST call "${forcedName}" using a <tool_call> block in this turn.`;
+    } else if (typeof toolChoice === "object") {
+      toolProtocol += `\nYou MUST call "${toolChoice.name}" using a <tool_call> block in this turn.`;
     }
 
     blocks.push(toolProtocol);
@@ -62,48 +55,42 @@ export function buildSystemPromptAppend(
 }
 
 /**
- * Serializes a single non-system OpenAI message into a clear transcript block.
+ * Serializes a single non-system message into a clear transcript block.
  */
-function serializeSingleMessage(msg: OpenAIMessage): string {
-  const text = extractTextContent(msg.content).trim();
-
-  if (msg.role === "user") {
-    return text;
-  }
+function serializeSingleMessage(msg: ChatMessage): string {
+  const text = textOf(msg.content).trim();
 
   if (msg.role === "assistant") {
     const parts: string[] = [];
     if (text) {
       // Strip any historical post-tool_call self-correction hallucinations from polluted transcripts
       const cleanedText =
-        msg.tool_calls && msg.tool_calls.length > 0
+        msg.toolCalls.length > 0
           ? text
               .replace(/^\s*(?:_\]|\]<\/tool_call>|<\/tool_call>|\]{2,}>\s*\u03f5?).*$/gms, "")
               .trim()
           : text;
       if (cleanedText) parts.push(cleanedText);
     }
-    if (msg.tool_calls && msg.tool_calls.length > 0) {
-      for (const tc of msg.tool_calls) {
-        let parsedArgs: unknown = {};
-        try {
-          parsedArgs = JSON.parse(tc.function.arguments || "{}");
-        } catch {
-          parsedArgs = tc.function.arguments;
-        }
-        parts.push(
-          `<tool_call>\n${JSON.stringify({
-            name: tc.function.name,
-            arguments: parsedArgs,
-          })}\n</tool_call>`
-        );
+    for (const tc of msg.toolCalls) {
+      let parsedArgs: unknown = {};
+      try {
+        parsedArgs = JSON.parse(tc.arguments || "{}");
+      } catch {
+        parsedArgs = tc.arguments;
       }
+      parts.push(
+        `<tool_call>\n${JSON.stringify({
+          name: tc.name,
+          arguments: parsedArgs,
+        })}\n</tool_call>`
+      );
     }
     return parts.join("\n");
   }
 
   if (msg.role === "tool") {
-    const idAttr = msg.tool_call_id ? ` id="${msg.tool_call_id}"` : "";
+    const idAttr = msg.toolCallId ? ` id="${msg.toolCallId}"` : "";
     const nameAttr = msg.name ? ` name="${msg.name}"` : "";
     return `<tool_response${idAttr}${nameAttr}>\n${text}\n</tool_response>`;
   }
@@ -115,18 +102,18 @@ function serializeSingleMessage(msg: OpenAIMessage): string {
  * Compiles full conversation history when creating a brand new ACP session (Cache Miss).
  */
 export function compileFullPrompt(
-  messages: OpenAIMessage[],
-  tools?: OpenAIToolDefinition[],
-  toolChoice?: unknown
+  messages: ChatMessage[],
+  tools: ToolDefinition[] = [],
+  toolChoice?: ToolChoice
 ): CompiledContext {
   const systemPromptAppend = buildSystemPromptAppend(messages, tools, toolChoice);
-  const nonSystem = messages.filter((m) => m.role !== "system" && m.role !== "developer");
+  const nonSystem = messages.filter((m) => m.role !== "system");
 
   // Single user message fast-path
   if (nonSystem.length === 1 && nonSystem[0].role === "user") {
     return {
       systemPromptAppend,
-      promptText: extractTextContent(nonSystem[0].content),
+      promptText: textOf(nonSystem[0].content),
     };
   }
 
@@ -152,6 +139,6 @@ export function compileFullPrompt(
  * Compiles ONLY the delta messages (e.g. `<tool_response>` or latest user message)
  * when a Session Prefix Hash hits an existing warm ACP session!
  */
-export function compileDeltaPrompt(deltaMessages: OpenAIMessage[]): string {
+export function compileDeltaPrompt(deltaMessages: ChatMessage[]): string {
   return deltaMessages.map((m) => serializeSingleMessage(m)).join("\n\n");
 }

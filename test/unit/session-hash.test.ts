@@ -1,17 +1,22 @@
 import "../helpers/isolate-env.js";
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { SessionAffinityRegistry } from "../../src/compiler/session-hash.js";
-import { OpenAIMessage, OpenAIToolDefinition } from "../../src/types/openai.js";
+import {
+  computeConversationHash,
+  prefixHashes,
+  SessionAffinityRegistry,
+} from "../../src/compiler/session-hash.js";
+import { ToolDefinition } from "../../src/core/chat.js";
+import { decodeMessages } from "../../src/protocols/openai/chat-completions.js";
+import { OpenAIMessage } from "../../src/types/openai.js";
 
-const tools: OpenAIToolDefinition[] = [
-  {
-    type: "function",
-    function: { name: "lookup", parameters: { type: "object", properties: { q: { type: "string" } } } },
-  },
+const tools: ToolDefinition[] = [
+  { name: "lookup", parameters: { type: "object", properties: { q: { type: "string" } } } },
 ];
 
-const history: OpenAIMessage[] = [
+const msgs = (list: OpenAIMessage[]) => decodeMessages(list);
+
+const history = msgs([
   { role: "system", content: "sys" },
   { role: "user", content: "find it" },
   {
@@ -21,7 +26,7 @@ const history: OpenAIMessage[] = [
       { id: "call_1", type: "function", function: { name: "lookup", arguments: '{"q":"a","n":1}' } },
     ],
   },
-];
+]);
 
 const always = () => true;
 
@@ -29,7 +34,7 @@ describe("SessionAffinityRegistry", () => {
   test("matches the stored prefix and returns only the new messages", () => {
     const reg = new SessionAffinityRegistry();
     reg.registerTurnState("m", tools, history, "w1", "s1");
-    const toolResult: OpenAIMessage = { role: "tool", tool_call_id: "call_1", content: "found" };
+    const toolResult = msgs([{ role: "tool", tool_call_id: "call_1", content: "found" }])[0];
 
     const match = reg.findBestMatchingPrefix("m", tools, [...history, toolResult], always);
     assert.ok(match);
@@ -41,7 +46,7 @@ describe("SessionAffinityRegistry", () => {
   test("is insensitive to tool-call ids, JSON key order and surrounding whitespace", () => {
     const reg = new SessionAffinityRegistry();
     reg.registerTurnState("m", tools, history, "w1", "s1");
-    const resent: OpenAIMessage[] = [
+    const resent = msgs([
       { role: "developer", content: "  sys " },
       { role: "user", content: "find it\n" },
       {
@@ -52,25 +57,55 @@ describe("SessionAffinityRegistry", () => {
         ],
       },
       { role: "user", content: "next" },
-    ];
+    ]);
     assert.ok(reg.findBestMatchingPrefix("m", tools, resent, always));
   });
 
   test("does not match across different models, tools or edited history", () => {
     const reg = new SessionAffinityRegistry();
     reg.registerTurnState("m", tools, history, "w1", "s1");
-    const next = [...history, { role: "user", content: "more" } as OpenAIMessage];
+    const next = [...history, ...msgs([{ role: "user", content: "more" }])];
 
     assert.equal(reg.findBestMatchingPrefix("other-model", tools, next, always), null);
     assert.equal(reg.findBestMatchingPrefix("m", [], next, always), null);
-    const edited = next.map((m, i) => (i === 1 ? { ...m, content: "find something else" } : m));
+    const edited = next.map((m, i) =>
+      i === 1 ? { ...m, content: [{ type: "text" as const, text: "find something else" }] } : m
+    );
     assert.equal(reg.findBestMatchingPrefix("m", tools, edited, always), null);
+  });
+
+  test("images take part in the hash", () => {
+    const withImage = (data: string) =>
+      msgs([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "what is this" },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${data}` } },
+          ],
+        },
+        { role: "assistant", content: "a cat" },
+        { role: "user", content: "sure?" },
+      ]);
+    const reg = new SessionAffinityRegistry();
+    reg.registerTurnState("m", [], withImage("AAAA").slice(0, 2), "w1", "s1");
+    assert.ok(reg.findBestMatchingPrefix("m", [], withImage("AAAA"), always));
+    assert.equal(reg.findBestMatchingPrefix("m", [], withImage("BBBB"), always), null);
+  });
+
+  test("the hash chain agrees with hashing each prefix on its own", () => {
+    const chain = prefixHashes("m", tools, history);
+    assert.equal(chain.length, history.length + 1);
+    chain.forEach((hash, k) => {
+      assert.equal(hash, computeConversationHash("m", tools, history.slice(0, k)));
+    });
+    assert.equal(new Set(chain).size, chain.length);
   });
 
   test("skips sessions whose worker is unavailable", () => {
     const reg = new SessionAffinityRegistry();
     reg.registerTurnState("m", tools, history, "w1", "s1");
-    const next = [...history, { role: "user", content: "more" } as OpenAIMessage];
+    const next = [...history, ...msgs([{ role: "user", content: "more" }])];
     assert.equal(reg.findBestMatchingPrefix("m", tools, next, () => false), null);
   });
 

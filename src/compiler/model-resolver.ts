@@ -1,6 +1,5 @@
 import { config, ThinkingLevel } from "../config.js";
 import { AcpModelInfo } from "../types/acp.js";
-import { OpenAIChatCompletionRequest } from "../types/openai.js";
 
 export interface UnifiedModelCatalogItem {
   id: string;
@@ -8,6 +7,12 @@ export interface UnifiedModelCatalogItem {
   thinkingLevels: ThinkingLevel[];
   defaultThinkingLevel: ThinkingLevel;
   variants: Partial<Record<ThinkingLevel, string>>;
+}
+
+/** What a request asks for: a model name (maybe with an effort suffix) and an explicit effort. */
+export interface ModelSelection {
+  model?: string;
+  effort?: ThinkingLevel | null;
 }
 
 export interface ResolvedModelTarget {
@@ -40,6 +45,13 @@ export function normalizeThinkingLevel(raw?: string | null): ThinkingLevel | nul
   if (v === "medium" || v === "med" || v === "normal" || v === "auto") return "medium";
   if (v === "high" || v === "xhigh" || v === "max" || v === "deep") return "high";
   return null;
+}
+
+/** Maps a thinking token budget onto the three effort levels ACP models expose. */
+export function thinkingLevelFromBudget(budgetTokens: number): ThinkingLevel {
+  if (budgetTokens <= 4096) return "low";
+  if (budgetTokens <= 16384) return "medium";
+  return "high";
 }
 
 /**
@@ -107,11 +119,11 @@ export function buildUnifiedModelCatalog(
 }
 
 /**
- * Parses model string and request parameters (`reasoning_effort`, `thinking`, `reasoning`, or model suffixes)
+ * Parses the model string (`-high`, `(low)`, `:medium` suffixes) and the explicit effort
  * into a unified `{ baseModelId, thinkingLevel, acpModelId }`.
  */
 export function resolveModelAndThinking(
-  req: OpenAIChatCompletionRequest,
+  req: ModelSelection,
   rawModels: AcpModelInfo[]
 ): ResolvedModelTarget {
   const catalog = buildUnifiedModelCatalog(rawModels);
@@ -136,27 +148,7 @@ export function resolveModelAndThinking(
     }
   }
 
-  // 3. Check request body reasoning parameters (`reasoning_effort`, `thinking`, `reasoning`)
-  let bodyLevel: ThinkingLevel | null = null;
-  if (req.reasoning_effort) {
-    bodyLevel = normalizeThinkingLevel(req.reasoning_effort);
-  } else if (req.thinking) {
-    if (req.thinking.effort || req.thinking.level) {
-      bodyLevel = normalizeThinkingLevel(req.thinking.effort || req.thinking.level);
-    } else if (typeof req.thinking.budget_tokens === "number") {
-      if (req.thinking.budget_tokens <= 4096) bodyLevel = "low";
-      else if (req.thinking.budget_tokens <= 16384) bodyLevel = "medium";
-      else bodyLevel = "high";
-    }
-  } else if (req.reasoning) {
-    if (req.reasoning.effort || req.reasoning.level) {
-      bodyLevel = normalizeThinkingLevel(req.reasoning.effort || req.reasoning.level);
-    } else if (typeof req.reasoning.max_tokens === "number") {
-      if (req.reasoning.max_tokens <= 4096) bodyLevel = "low";
-      else if (req.reasoning.max_tokens <= 16384) bodyLevel = "medium";
-      else bodyLevel = "high";
-    }
-  }
+  const bodyLevel = req.effort ?? null;
 
   // Priority: Explicit body reasoning_effort > Explicit model string suffix > Default config thinking level
   const desiredLevel: ThinkingLevel =

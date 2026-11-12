@@ -6,6 +6,7 @@ import {
   resolveModelAndThinking,
   stripModelThinkingSuffix,
 } from "../../src/compiler/model-resolver.js";
+import { reasoningEffortFromBody } from "../../src/protocols/openai/chat-completions.js";
 
 const raw = [
   ...["gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"].flatMap((base) =>
@@ -17,8 +18,8 @@ const raw = [
   { modelId: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" },
 ];
 
-const resolve = (body: Record<string, unknown>) =>
-  resolveModelAndThinking({ messages: [], ...body } as any, raw);
+const resolve = (body: { model: string } & Parameters<typeof reasoningEffortFromBody>[0]) =>
+  resolveModelAndThinking({ model: body.model, effort: reasoningEffortFromBody(body) }, raw);
 
 describe("model resolver", () => {
   test("groups effort variants into base models", () => {

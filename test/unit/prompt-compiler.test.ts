@@ -3,14 +3,20 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   buildSystemPromptAppend,
-  compileDeltaPrompt,
-  compileFullPrompt,
+  compileDeltaPrompt as compileDeltaNeutral,
+  compileFullPrompt as compileFullNeutral,
 } from "../../src/compiler/prompt-compiler.js";
-import { OpenAIMessage, OpenAIToolDefinition } from "../../src/types/openai.js";
+import { ToolChoice, ToolDefinition } from "../../src/core/chat.js";
+import { decodeMessages } from "../../src/protocols/openai/chat-completions.js";
+import { OpenAIMessage } from "../../src/types/openai.js";
 
-const tools: OpenAIToolDefinition[] = [
-  { type: "function", function: { name: "search", description: "web search", parameters: { type: "object" } } },
+const tools: ToolDefinition[] = [
+  { name: "search", description: "web search", parameters: { type: "object" } },
 ];
+
+const compileFullPrompt = (messages: OpenAIMessage[], t?: ToolDefinition[], choice?: ToolChoice) =>
+  compileFullNeutral(decodeMessages(messages), t, choice);
+const compileDeltaPrompt = (messages: OpenAIMessage[]) => compileDeltaNeutral(decodeMessages(messages));
 
 describe("prompt compiler", () => {
   test("single user message is sent verbatim; system text goes to the append", () => {
@@ -32,7 +38,7 @@ describe("prompt compiler", () => {
     assert.doesNotMatch(buildSystemPromptAppend([], tools, "none"), /<available_tools>/);
     assert.match(buildSystemPromptAppend([], tools, "required"), /MUST emit at least one <tool_call>/);
     assert.match(
-      buildSystemPromptAppend([], tools, { type: "function", function: { name: "search" } }),
+      buildSystemPromptAppend([], tools, { name: "search" }),
       /You MUST call "search"/
     );
   });

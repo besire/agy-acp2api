@@ -1,8 +1,8 @@
 import crypto from "node:crypto";
 import { config, onConfigChange } from "../config.js";
 import { SessionAffinityRegistry } from "../compiler/session-hash.js";
+import { ChatMessage, ToolDefinition } from "../core/chat.js";
 import { AcpModelInfo } from "../types/acp.js";
-import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
 import { AcpWorker } from "./acp-worker.js";
 import { sweepStaleSandboxes } from "./sandbox.js";
 
@@ -10,7 +10,7 @@ export interface LeaseAcquisition {
   worker: AcpWorker;
   sessionId: string | null;
   isReusedSession: boolean;
-  deltaMessages: OpenAIMessage[];
+  deltaMessages: ChatMessage[];
   matchedPrefixLength: number;
 }
 
@@ -115,14 +115,14 @@ export class WorkerPool {
   }
 
   /**
-   * Acquires a worker for the given OpenAI request.
+   * Acquires a worker for the given conversation.
    * Uses `baseModelId` for Session Prefix Hash affinity so changing `reasoning_effort`
    * mid-conversation still hits the warm session!
    */
   public async acquireForRequest(
     baseModelId: string,
-    tools: OpenAIToolDefinition[] | undefined,
-    messages: OpenAIMessage[]
+    tools: ToolDefinition[],
+    messages: ChatMessage[]
   ): Promise<LeaseAcquisition> {
     // 1. Check Session Prefix Hash affinity
     const match = this.sessionRegistry.findBestMatchingPrefix(

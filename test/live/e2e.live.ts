@@ -17,7 +17,9 @@ import {
    TelemetryStore,
   telemetryStore,
 } from "../../src/telemetry/metrics-store.js";
+import { ToolCall } from "../../src/core/chat.js";
 import { ToolCallStreamParser } from "../../src/parser/stream-parser.js";
+import { reasoningEffortFromBody } from "../../src/protocols/openai/chat-completions.js";
 import { WorkerPool } from "../../src/pool/worker-pool.js";
 import { createGatewayApp } from "../../src/server/app.js";
 import {
@@ -32,9 +34,12 @@ function testSlidingWindowParserUnit() {
   console.log(
     "1. [Unit Test] Testing ToolCallStreamParser sliding window & partial prefix holdback..."
   );
-  const parser = new ToolCallStreamParser();
   const emittedText: string[] = [];
-  const emittedTools: OpenAIToolCallDelta[] = [];
+  const emittedTools: ToolCall[] = [];
+  const parser = new ToolCallStreamParser((ev) => {
+    if (ev.type === "text") emittedText.push(ev.text);
+    else emittedTools.push(ev.call);
+  });
 
   const chunks = [
     "Hello! I will check <div> and then call a tool: <",
@@ -46,29 +51,33 @@ function testSlidingWindowParserUnit() {
   ];
 
   for (const c of chunks) {
-    parser.feed(
-      c,
-      (txt) => emittedText.push(txt),
-      (tc) => emittedTools.push(tc)
-    );
+    parser.feed(c);
   }
-  const finishReason = parser.flush(
-    (txt) => emittedText.push(txt),
-    (tc) => emittedTools.push(tc)
-  );
+  const finishReason = parser.flush();
 
   assert.equal(
     emittedText.join(""),
     "Hello! I will check <div> and then call a tool: "
   );
   assert.equal(emittedTools.length, 1);
-  assert.equal(emittedTools[0].function?.name, "calculate_sum");
+  assert.equal(emittedTools[0].name, "calculate_sum");
   assert.deepEqual(
-    JSON.parse(emittedTools[0].function?.arguments || "{}"),
+    JSON.parse(emittedTools[0].arguments || "{}"),
     { a: 10, b: 25 }
   );
   assert.equal(finishReason, "tool_calls");
   console.log("   -> Passed! Sliding window parser verified.");
+}
+
+// Resolves an OpenAI-style body the way the chat endpoint does
+function resolveModelAndThinkingFromBody(
+  body: { model: string; messages: unknown[] } & Parameters<typeof reasoningEffortFromBody>[0],
+  rawModels: Parameters<typeof resolveModelAndThinking>[1]
+) {
+  return resolveModelAndThinking(
+    { model: body.model, effort: reasoningEffortFromBody(body) },
+    rawModels
+  );
 }
 
 function testUnifiedModelAndEffortResolverUnit() {
@@ -96,7 +105,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.deepEqual(argon.thinkingLevels, ["low", "medium", "high"]);
 
   // Test 1: Base model + reasoning_effort (Carbon & Argon)
-  const rc1 = resolveModelAndThinking(
+  const rc1 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon", reasoning_effort: "high", messages: [] },
     sampleRaw
   );
@@ -104,7 +113,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc1.thinkingLevel, "high");
   assert.equal(rc1.acpModelId, "gemini-4-carbon-high");
 
-  const rc2 = resolveModelAndThinking(
+  const rc2 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon(low)", messages: [] },
     sampleRaw
   );
@@ -112,7 +121,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc2.thinkingLevel, "low");
   assert.equal(rc2.acpModelId, "gemini-4-carbon-low");
 
-  const rc3 = resolveModelAndThinking(
+  const rc3 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon:medium", messages: [] },
     sampleRaw
   );
@@ -120,7 +129,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc3.thinkingLevel, "medium");
   assert.equal(rc3.acpModelId, "gemini-4-carbon-medium");
 
-  const r1 = resolveModelAndThinking(
+  const r1 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-argon", reasoning_effort: "high", messages: [] },
     sampleRaw
   );
@@ -129,7 +138,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r1.acpModelId, "gemini-4-argon-high");
 
   // Test 2: Model with bracket syntax `gemini-3.8-flash(low)`
-  const r2 = resolveModelAndThinking(
+  const r2 = resolveModelAndThinkingFromBody(
     { model: "gemini-3.8-flash(low)", messages: [] },
     sampleRaw
   );
@@ -138,7 +147,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r2.acpModelId, "gemini-3.8-flash-low");
 
   // Test 3: Model with thinking.budget_tokens
-  const r3 = resolveModelAndThinking(
+  const r3 = resolveModelAndThinkingFromBody(
     {
       model: "gemini-4-argon",
       thinking: { type: "enabled", budget_tokens: 32000 },

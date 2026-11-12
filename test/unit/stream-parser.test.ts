@@ -1,17 +1,26 @@
 import "../helpers/isolate-env.js";
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
-import { ToolCallStreamParser } from "../../src/parser/stream-parser.js";
-import { OpenAIToolCallDelta } from "../../src/types/openai.js";
+import { ToolCall } from "../../src/core/chat.js";
+import { ParserEvent, ToolCallStreamParser } from "../../src/parser/stream-parser.js";
+
+function collector() {
+  const text: string[] = [];
+  const tools: Array<ToolCall & { index: number }> = [];
+  const emit = (ev: ParserEvent) => {
+    if (ev.type === "text") text.push(ev.text);
+    else tools.push({ index: ev.index, ...ev.call });
+  };
+  return { text, tools, emit };
+}
 
 function run(chunks: string[]) {
-  const parser = new ToolCallStreamParser();
-  const text: string[] = [];
-  const tools: OpenAIToolCallDelta[] = [];
+  const { text, tools, emit } = collector();
+  const parser = new ToolCallStreamParser(emit);
   for (const c of chunks) {
-    parser.feed(c, (t) => text.push(t), (tc) => tools.push(tc));
+    parser.feed(c);
   }
-  const finish = parser.flush((t) => text.push(t), (tc) => tools.push(tc));
+  const finish = parser.flush();
   return { parser, text: text.join(""), tools, finish };
 }
 
@@ -27,8 +36,8 @@ describe("ToolCallStreamParser", () => {
     ]);
     assert.equal(text, "Hello! I will check <div> and then call a tool: ");
     assert.equal(tools.length, 1);
-    assert.equal(tools[0].function?.name, "calculate_sum");
-    assert.deepEqual(JSON.parse(tools[0].function?.arguments || ""), { a: 10, b: 25 });
+    assert.equal(tools[0].name, "calculate_sum");
+    assert.deepEqual(JSON.parse(tools[0].arguments || ""), { a: 10, b: 25 });
     assert.equal(finish, "tool_calls");
   });
 
@@ -47,7 +56,7 @@ describe("ToolCallStreamParser", () => {
     ]);
     assert.equal(text, "a");
     assert.deepEqual(
-      tools.map((t) => [t.index, t.function?.name]),
+      tools.map((t) => [t.index, t.name]),
       [
         [0, "x"],
         [1, "y"],
@@ -66,10 +75,10 @@ describe("ToolCallStreamParser", () => {
       '<tool_call>{"function":{"name":"f","arguments":"{\\"k\\":2}"}}</tool_call>',
       '<tool_call>{"name":"g","parameters":{"k":3}}</tool_call>',
     ]);
-    assert.equal(tools[0].function?.name, "f");
-    assert.equal(tools[0].function?.arguments, '{"k":2}');
-    assert.equal(tools[1].function?.name, "g");
-    assert.equal(tools[1].function?.arguments, '{"k":3}');
+    assert.equal(tools[0].name, "f");
+    assert.equal(tools[0].arguments, '{"k":2}');
+    assert.equal(tools[1].name, "g");
+    assert.equal(tools[1].arguments, '{"k":3}');
   });
 
   test("falls back to raw text when the first block is not a tool call, keeping later text", () => {
@@ -94,18 +103,18 @@ describe("ToolCallStreamParser", () => {
   test("salvages a tool call the model never closed", () => {
     const { tools, finish } = run(['<tool_call>{"name":"x","arguments":{"q":"z"}}']);
     assert.equal(tools.length, 1);
-    assert.equal(tools[0].function?.arguments, '{"q":"z"}');
+    assert.equal(tools[0].arguments, '{"q":"z"}');
     assert.equal(finish, "tool_calls");
   });
 
   test("injectDirectToolCall goes through the same accumulation and dedupe", () => {
-    const parser = new ToolCallStreamParser();
-    const seen: OpenAIToolCallDelta[] = [];
-    parser.injectDirectToolCall("native", { a: 1 }, (d) => seen.push(d));
-    parser.injectDirectToolCall("native", { a: 1 }, (d) => seen.push(d));
-    assert.equal(seen.length, 1);
+    const { tools, emit } = collector();
+    const parser = new ToolCallStreamParser(emit);
+    parser.injectDirectToolCall("native", { a: 1 });
+    parser.injectDirectToolCall("native", { a: 1 });
+    assert.equal(tools.length, 1);
     const msg = parser.toAssistantMessage();
-    assert.equal(msg.content, null);
-    assert.equal(msg.tool_calls?.[0].function.arguments, '{"a":1}');
+    assert.deepEqual(msg.content, []);
+    assert.equal(msg.toolCalls[0].arguments, '{"a":1}');
   });
 });
