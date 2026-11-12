@@ -49,6 +49,14 @@ interface PendingRpc {
 
 export type WorkerState = "STARTING" | "IDLE" | "BUSY" | "DEAD";
 
+/**
+ * `AGY2API_MODEL_SNIFFER=1` proxies agy's backend traffic through a local sniffer to read the
+ * model version that actually answered.
+ */
+export function modelSnifferEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.AGY2API_MODEL_SNIFFER?.trim() ?? "");
+}
+
 const STDERR_TAIL_LIMIT = 4096;
 // After `exit`, wait this long for stdio to drain so the stderr tail is complete
 const EXIT_DRAIN_GRACE_MS = 250;
@@ -87,21 +95,25 @@ export class AcpWorker {
   }
 
   public async start(): Promise<void> {
-    const snifferPort = await this.sniffer.start((detectedVer) => {
-      const cleanVer = stripModelThinkingSuffix(detectedVer);
-      for (const listener of this.activeStreamListeners.values()) {
-        listener.onActualModelDetected?.(cleanVer);
-      }
-    });
-
     const args = [
       "acp",
       "--sandbox",
       "--include-default-customizations=false",
       `--gemini-dir=${this.sandbox.absGeminiDir}`,
       `--agent=${this.sandbox.agentName}`,
-      `--cloud_code_endpoint=http://127.0.0.1:${snifferPort}`,
     ];
+
+    // Opt-in: routing agy's traffic through a local Node proxy changes what Google sees on the
+    // wire (TLS stack, HTTP/1.1), so by default agy talks to its backend directly
+    if (modelSnifferEnabled()) {
+      const snifferPort = await this.sniffer.start((detectedVer) => {
+        const cleanVer = stripModelThinkingSuffix(detectedVer);
+        for (const listener of this.activeStreamListeners.values()) {
+          listener.onActualModelDetected?.(cleanVer);
+        }
+      });
+      args.push(`--cloud_code_endpoint=http://127.0.0.1:${snifferPort}`);
+    }
 
     const childEnv: NodeJS.ProcessEnv = {
       ...process.env,

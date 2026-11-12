@@ -571,6 +571,53 @@ async function runIntegrationTest() {
     console.log("   -> Usage:", JSON.stringify(imageJson.usage));
     assert.match(answer, /red/i);
 
+    console.log("\n9. [E2E Regenerate] Re-sending Turn 2 must not be appended to the session that already answered it...");
+    const regenRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({ model: "gemini-3.8-flash(low)", messages, tools, stream: false }),
+    });
+    assert.equal(regenRes.status, 200);
+    const regenCache = regenRes.headers.get("X-Agy2Api-Session-Cache");
+    const regenSession = regenRes.headers.get("X-Agy2Api-Session-Id");
+    const regenJson = (await regenRes.json()) as any;
+    console.log(`   -> Headers: Cache=${regenCache}, SessionId=${regenSession}`);
+    console.log("   -> Content:", JSON.stringify(regenJson.choices[0].message.content));
+    assert.equal(regenCache, "MISS");
+    assert.notEqual(regenSession, sessionId1);
+    // The full transcript (including the tool result) was replayed into the new session
+    assert.ok(String(regenJson.choices[0].message.content).includes("OMEGA-SH-7749"));
+
+    console.log("\n10. [E2E Stop Sequence] Counting with stop=[\"7\"] must end before the 7...");
+    const stopRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash",
+        reasoning_effort: "low",
+        stop: ["7"],
+        stream: true,
+        messages: [
+          {
+            role: "user",
+            content: "Count from 1 to 20 in digits, separated by commas, nothing else.",
+          },
+        ],
+      }),
+    });
+    assert.equal(stopRes.status, 200);
+    const stopped = await consumeSseStream(stopRes);
+    console.log("   -> Content:", JSON.stringify(stopped.content), "finish:", stopped.finishReason);
+    assert.equal(stopped.finishReason, "stop");
+    assert.match(stopped.content, /6/);
+    assert.ok(!stopped.content.includes("7"), "nothing after the stop sequence");
+
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {
     pool.shutdown();

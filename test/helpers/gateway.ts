@@ -25,6 +25,8 @@ export interface AcpLogEntry {
   t: number;
   pid: number;
   event?: string;
+  /** On `boot`: the arguments agy was started with. */
+  argv?: string[];
   dir?: "in";
   msg?: { id?: number | string; method?: string; params?: any };
 }
