@@ -21,7 +21,8 @@ export function extractTextContent(content: OpenAIMessage["content"]): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .map((part) => (part.type === "text" ? part.text || "" : ""))
+      .filter((part) => part.type === "text")
+      .map((part) => part.text || "")
       .join("\n");
   }
   return String(content);
