@@ -55,12 +55,14 @@ interface QueuedWaiter {
   resolve: (worker: AcpWorker) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  since: number;
 }
 
 /** Waits for one particular worker; resolves true once that worker is handed over BUSY. */
 interface AffinityWaiter {
   resolve: (granted: boolean) => void;
   timer: NodeJS.Timeout;
+  since: number;
 }
 
 function envNonNegativeInt(name: string, fallback: number): number {
@@ -173,6 +175,8 @@ export class WorkerPool {
       );
     const reuse = (worker: AcpWorker, match: NonNullable<ReturnType<typeof findMatch>>) => {
       this.sessionRegistry.claim(match.entry);
+      // Preparing the prompt (e.g. downloading images) must not race the idle-session sweep
+      worker.touchSession(match.entry.sessionId);
       return {
         worker,
         sessionId: match.entry.sessionId,
@@ -259,9 +263,13 @@ export class WorkerPool {
       this.cachedModels = worker.availableModels;
     }
 
-    // Requests waiting for this particular worker's sessions come first
-    const affinity = this.affinityWaiters.get(worker.id)?.shift();
-    if (affinity) {
+    // Hand the worker to whoever has waited longest: a request for one of its sessions, or
+    // any queued request (so a stream of affinity waits cannot starve the queue)
+    const affinityQueue = this.affinityWaiters.get(worker.id);
+    const affinity = affinityQueue?.[0];
+    if (affinity && !(this.waitQueue[0]?.since < affinity.since)) {
+      affinityQueue!.shift();
+      if (affinityQueue!.length === 0) this.affinityWaiters.delete(worker.id);
       clearTimeout(affinity.timer);
       this.reserve(worker);
       affinity.resolve(true);
@@ -557,6 +565,7 @@ export class WorkerPool {
       this.affinityWaiters.set(worker.id, waiters);
       const waiter: AffinityWaiter = {
         resolve,
+        since: Date.now(),
         timer: setTimeout(() => {
           const idx = waiters.indexOf(waiter);
           if (idx !== -1) waiters.splice(idx, 1);
@@ -592,7 +601,7 @@ export class WorkerPool {
         );
       }, timeoutMs);
 
-      this.waitQueue.push({ resolve, reject, timer });
+      this.waitQueue.push({ resolve, reject, timer, since: Date.now() });
     });
   }
 

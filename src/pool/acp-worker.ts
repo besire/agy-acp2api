@@ -216,6 +216,13 @@ export class AcpWorker {
     return this.activeStreamListeners.has(sessionId);
   }
 
+  /** Marks a session as just used, so the idle sweep leaves it alone until its prompt starts. */
+  public touchSession(sessionId: string): void {
+    if (this.sessionLastUsedAt.has(sessionId)) {
+      this.sessionLastUsedAt.set(sessionId, Date.now());
+    }
+  }
+
   /**
    * Creates a new ACP session on this worker in native `default` mode (no plan/build switching),
    * sets the target `acpModelId`, and injects `<system_override>` + external tool schemas.

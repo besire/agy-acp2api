@@ -122,6 +122,27 @@ describe("session affinity", () => {
     });
   });
 
+  test("a request that queued earlier is served before a later affinity wait", async () => {
+    await withGateway({ env: { AGY_MAX_WORKERS: "1" } }, async (gw) => {
+      const u1 = { role: "user", content: "conversation A" };
+      const a1 = await turn(gw, [u1]);
+      const started = (text: RegExp) =>
+        gw.acpRequests("session/prompt").findIndex((m) => text.test(m.params.prompt[0].text));
+
+      const busy = turn(gw, [{ role: "user", content: "conversation B [[slow:600]]" }]);
+      await waitFor(() => started(/conversation B/) !== -1, { what: "conversation B to start" });
+      // C queues for any worker first, then A's follow-up waits for its own session's worker
+      const c = turn(gw, [{ role: "user", content: "conversation C" }]);
+      await new Promise((r) => setTimeout(r, 100));
+      const a2 = turn(gw, [u1, a1.reply, { role: "user", content: "follow-up A" }]);
+
+      const [, , second] = await Promise.all([busy, c, a2]);
+      assert.ok(started(/conversation C/) < started(/follow-up A/), "C was waiting longer");
+      assert.equal(second.cache, "HIT");
+      assert.equal(second.sessionId, a1.sessionId);
+    });
+  });
+
   test("gives up after the affinity wait and records why", async () => {
     await withGateway({ env: { AGY_MAX_WORKERS: "2", AGY2API_AFFINITY_WAIT_MS: "100" } }, async (gw) => {
       const u1 = { role: "user", content: "conversation A" };
