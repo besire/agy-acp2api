@@ -36,6 +36,9 @@ func DefaultConfig() Config {
 	}
 }
 
+// adminKeyHeader authenticates admin calls against the local agy-acp2api service.
+const adminKeyHeader = "X-Agy2Api-Key"
+
 type HostCallbackFunc func(method string, payload []byte) ([]byte, error)
 
 type App struct {
@@ -301,11 +304,15 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 
 	a.mu.RLock()
 	upstream := a.cfg.UpstreamURL
+	apiKey := a.cfg.APIKey
 	a.mu.RUnlock()
 
 	path := req.Path
 	resourcePrefix := "/v0/resource/plugins/" + PluginID
 	mgmtPrefix := "/v0/management/plugins/" + PluginID
+	// Only /v0/management is authenticated by CPA itself, so only there may the plugin vouch
+	// for the caller with its own key. Resource routes must bring the gateway key from the browser.
+	isManagement := strings.HasPrefix(path, mgmtPrefix)
 
 	var targetPath string
 	if strings.HasPrefix(path, resourcePrefix) {
@@ -334,8 +341,8 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		}
 		if b := req.Query.Get("_body"); b != "" && len(bodyBytes) == 0 {
 			bodyBytes = []byte(b)
-			req.Query.Del("_body")
 		}
+		req.Query.Del("_body")
 	}
 	if method == "" {
 		method = http.MethodGet
@@ -354,12 +361,17 @@ func (a *App) handleManagement(raw []byte) ([]byte, error) {
 		return OKEnvelope(a.offlineResponse(targetPath, upstream, err))
 	}
 	for k, vals := range req.Headers {
-		if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Content-Length") {
+		// Authorization carries the CPA management key: never leak it upstream
+		if strings.EqualFold(k, "Host") || strings.EqualFold(k, "Content-Length") ||
+			strings.EqualFold(k, "Authorization") {
 			continue
 		}
 		for _, v := range vals {
 			httpReq.Header.Add(k, v)
 		}
+	}
+	if isManagement && apiKey != "" {
+		httpReq.Header.Set(adminKeyHeader, apiKey)
 	}
 	if len(bodyBytes) > 0 && httpReq.Header.Get("Content-Type") == "" {
 		httpReq.Header.Set("Content-Type", "application/json")

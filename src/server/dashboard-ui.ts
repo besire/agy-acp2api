@@ -323,6 +323,8 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   dialog h3 { margin:16px 0 0; font-size:24px; font-weight:400; text-align:center; }
   dialog p { margin:16px 0 0; color:var(--on-surface-variant); text-align:center; word-break:break-all; }
   .dlg-act { display:flex; justify-content:flex-end; gap:8px; margin-top:24px; }
+  #auth-key { display:block; width:100%; box-sizing:border-box; margin-top:16px; height:48px; padding:0 14px; border:0; outline:0; border-radius:4px; box-shadow:inset 0 0 0 1px var(--outline); background:transparent; color:var(--on-surface); font-family:var(--mono); font-size:14px; }
+  #auth-key:focus { box-shadow:inset 0 0 0 2px var(--primary); }
 
   .snack { position:fixed; left:50%; bottom:24px; transform:translate(-50%, 24px); min-width:240px; max-width:560px; padding:14px 16px; border-radius:4px;
            background:var(--inverse-surface); color:var(--inverse-on-surface); box-shadow:0 4px 8px 3px rgba(0,0,0,.15); z-index:50;
@@ -552,6 +554,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   <p id="dlg-p"></p>
   <div class="dlg-act"><button class="btn text" id="dlg-no">取消</button><button class="btn text" id="dlg-ok">确定</button></div>
 </dialog>
+<dialog id="auth-dlg">
+  <div class="dlg-ic"><span class="ms">key</span></div>
+  <h3>输入 API Key</h3>
+  <p>管理接口需要鉴权，请输入网关的 API Key（与 /v1 接口使用的相同）。</p>
+  <input id="auth-key" type="password" autocomplete="off" spellcheck="false" />
+  <div class="dlg-act"><button class="btn text" id="auth-ok">确定</button></div>
+</dialog>
 <div class="snack" id="snack"></div>
 <div class="tip" id="tip"></div>
 
@@ -584,6 +593,40 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     } catch (e) {
       return "";
     }
+  }
+  var ADMIN_KEY_STORE = "agy2api-admin-key";
+  function getAdminKey() { try { return localStorage.getItem(ADMIN_KEY_STORE) || ""; } catch (e) { return ""; } }
+  function setAdminKey(k) { try { if (k) localStorage.setItem(ADMIN_KEY_STORE, k); else localStorage.removeItem(ADMIN_KEY_STORE); } catch (e) {} }
+  function authHeaders() {
+    var h = {};
+    var mgmtKey = getCpaManagementKey();
+    if (mgmtKey) h["Authorization"] = "Bearer " + mgmtKey;
+    var k = getAdminKey();
+    if (k) h["X-Agy2Api-Key"] = k;
+    return h;
+  }
+  var authPending = null;
+  function askAdminKey() {
+    if (authPending) return authPending;
+    authPending = new Promise(function (res) {
+      var d = $("auth-dlg"), inp = $("auth-key");
+      inp.value = "";
+      var done = function () {
+        var v = inp.value.trim();
+        if (!v) { inp.focus(); return; }
+        setAdminKey(v);
+        $("auth-ok").onclick = null; inp.onkeydown = null; d.oncancel = null;
+        if (d.open) d.close();
+        authPending = null;
+        res(v);
+      };
+      $("auth-ok").onclick = done;
+      inp.onkeydown = function (e) { if (e.key === "Enter") done(); };
+      d.oncancel = function (e) { e.preventDefault(); };
+      d.showModal();
+      inp.focus();
+    });
+    return authPending;
   }
   function resolveApiUrl(relPath) {
     var p = relPath.replace(/^\.?\//, "");
@@ -952,7 +995,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     if (S.cfgReady && S.dirty) return;
     if (S.cfgReady) return;
     setDirty(false);
-    $("f-apiKey").value = c.apiKey || "";
+    $("f-apiKey").value = getAdminKey();
     $("f-model").value = c.defaultModel;
     S.level = c.defaultThinkingLevel || "medium";
     renderLevel();
@@ -983,6 +1026,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     };
     if (!p.apiKey) { snack("API Key 不能为空", true); return; }
     await api("POST", "./api/admin/config", p);
+    setAdminKey(p.apiKey);
     setDirty(false);
     S.cfgReady = false;
     snack("已保存");
@@ -1079,9 +1123,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return baseDir + p;
   }
   async function api(method, url, body) {
-    var hdrs = {};
-    var mgmtKey = getCpaManagementKey();
-    if (mgmtKey) hdrs["Authorization"] = "Bearer " + mgmtKey;
+    var hdrs = authHeaders();
     var isCpaResource = location.pathname.indexOf("/v0/resource/plugins/") === 0;
     var r;
     if (isCpaResource && method !== "GET") {
@@ -1096,6 +1138,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     }
     var j = {};
     try { j = await r.json(); } catch (e) {}
+    if (r.status === 401) { askAdminKey().then(poll); throw new Error("API Key 无效或缺失"); }
     if (!r.ok || j.status === "error" || j.status === "not_found") throw new Error(j.message || j.status || "HTTP " + r.status);
     return j;
   }
@@ -1164,10 +1207,9 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   }
   async function poll() {
     try {
-      var hdrs = {};
-      var mgmtKey = getCpaManagementKey();
-      if (mgmtKey) hdrs["Authorization"] = "Bearer " + mgmtKey;
+      var hdrs = authHeaders();
       var r = await fetch(resolveApiUrl("./api/admin/overview"), { cache: "no-store", headers: Object.keys(hdrs).length ? hdrs : undefined });
+      if (r.status === 401) { setSync(false); await askAdminKey(); return poll(); }
       if (!r.ok) throw new Error("HTTP " + r.status);
       S.d = await r.json();
       S.last = Date.now();
