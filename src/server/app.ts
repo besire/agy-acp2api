@@ -127,6 +127,7 @@ export function createGatewayApp(pool: WorkerPool): Hono {
       pool: pool.getStats(),
       workers: pool.getDetailedWorkers(),
       config: publicConfig(),
+      agent: pool.getAgentInfo(),
       unifiedModels,
       telemetry: telemetryStore.getSnapshot(),
     });

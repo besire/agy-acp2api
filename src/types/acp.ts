@@ -22,6 +22,26 @@ export interface JsonRpcNotification {
   params?: Record<string, unknown>;
 }
 
+/** What the agent declares in its `initialize` response. */
+export interface AcpInitializeResult {
+  protocolVersion: number;
+  agentCapabilities?: {
+    loadSession?: boolean;
+    promptCapabilities?: {
+      image?: boolean;
+      audio?: boolean;
+      embeddedContext?: boolean;
+    };
+    [key: string]: unknown;
+  };
+  agentInfo?: {
+    name?: string;
+    title?: string;
+    version?: string;
+  };
+  authMethods?: Array<{ id: string; name?: string; description?: string }>;
+}
+
 export interface AcpModelInfo {
   modelId: string;
   name: string;

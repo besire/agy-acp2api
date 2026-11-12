@@ -793,6 +793,23 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       '<span class="chip t-plain" data-tip="常驻 – 上限"><span class="ms">width</span>' + d.config.minWorkers + "–" + d.config.maxWorkers + "</span>" +
       "</div>";
   }
+  // What agy declared in ACP initialize; null until a worker has started
+  function agentMeta(d) {
+    var a = d.agent;
+    if (!a) return "";
+    var info = a.agentInfo || {}, pc = (a.agentCapabilities || {}).promptCapabilities || {};
+    var name = (info.title || info.name || "agy") + (info.version ? " " + info.version : "");
+    function cap(on, icon, label) {
+      return '<span class="chip ' + (on ? "t-ok" : "t-plain") + '" data-tip="' + label + (on ? " · 支持" : " · 不支持") + '">' +
+        '<span class="ms">' + (on ? icon : "block") + "</span>" + label + "</span>";
+    }
+    return '<div class="pool-meta">' +
+      '<span class="chip t-plain" data-tip="上游 Agent"><span class="ms">smart_toy</span>' + esc(name) + "</span>" +
+      '<span class="chip t-plain" data-tip="ACP 协议版本"><span class="ms">swap_horiz</span>ACP v' + esc(a.protocolVersion) + "</span>" +
+      '<span class="grow"></span>' +
+      cap(pc.image, "image", "图片输入") + cap(pc.audio, "mic", "音频输入") + cap(pc.embeddedContext, "description", "嵌入资源") +
+      "</div>";
+  }
 
   /* ---------- pages ---------- */
   function kpi(icon, toneCls, label, body, foot) {
@@ -911,7 +928,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   function renderRuntime(d) {
     var now = Date.now();
-    $("rt-pool").innerHTML = slots(d) + poolMeta(d);
+    $("rt-pool").innerHTML = slots(d) + poolMeta(d) + agentMeta(d);
 
     if (!d.workers.length) $("rt-workers").innerHTML = '<div class="card">' + empty("memory", "无进程") + "</div>";
     else $("rt-workers").innerHTML = d.workers.map(function (w) {

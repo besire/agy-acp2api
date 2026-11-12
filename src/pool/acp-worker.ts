@@ -5,6 +5,7 @@ import { config } from "../config.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
   AcpConfigOption,
+  AcpInitializeResult,
   AcpModelInfo,
   AcpPromptResult,
   AcpSessionNewResult,
@@ -59,6 +60,8 @@ export class AcpWorker {
   public state: WorkerState = "STARTING";
   public lastUsedAt: number = Date.now();
   public availableModels: AcpModelInfo[] = [];
+  /** The agent's `initialize` response (protocol version, prompt capabilities, agent info). */
+  public agentInfo: AcpInitializeResult | null = null;
   public totalRequestsHandled: number = 0;
 
   private proc: ChildProcessWithoutNullStreams | null = null;
@@ -159,7 +162,7 @@ export class AcpWorker {
 
     // Perform ACP JSON-RPC handshake
     try {
-      await this.sendRpc("initialize", {
+      this.agentInfo = await this.sendRpc<AcpInitializeResult>("initialize", {
         protocolVersion: 1,
         clientCapabilities: {},
       });
@@ -387,7 +390,14 @@ export class AcpWorker {
     this.hooks.onSessionClosed?.(sessionId);
     try {
       await this.sendRpc("session/close", { sessionId }, 5000);
-    } catch {}
+    } catch (err: any) {
+      // The session is forgotten locally either way; upstream may keep it alive until the worker exits
+      console.warn(
+        `[agy-acp2api] session/close failed for ${sessionId} on worker ${this.id}: ${
+          err?.message || String(err)
+        }`
+      );
+    }
   }
 
   /**

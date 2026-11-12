@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { config, onConfigChange } from "../config.js";
 import { SessionAffinityRegistry } from "../compiler/session-hash.js";
 import { ChatMessage, ToolDefinition } from "../core/chat.js";
-import { AcpModelInfo } from "../types/acp.js";
+import { AcpInitializeResult, AcpModelInfo } from "../types/acp.js";
 import { AcpWorker } from "./acp-worker.js";
 import { sweepStaleSandboxes } from "./sandbox.js";
 
@@ -71,6 +71,7 @@ export class WorkerPool {
   private lastWorkerError: string | null = null;
   private shuttingDown = false;
   private cachedModels: AcpModelInfo[] = [...DEFAULT_FALLBACK_MODELS];
+  private lastAgentInfo: AcpInitializeResult | null = null;
   private readonly opts: Required<WorkerPoolOptions>;
   public readonly sessionRegistry: SessionAffinityRegistry;
 
@@ -211,6 +212,11 @@ export class WorkerPool {
 
   public getAvailableModels(): AcpModelInfo[] {
     return this.cachedModels;
+  }
+
+  /** What the most recently started `agy` declared in `initialize`; null until one has started. */
+  public getAgentInfo(): AcpInitializeResult | null {
+    return this.lastAgentInfo;
   }
 
   public getStats() {
@@ -356,6 +362,8 @@ export class WorkerPool {
       worker.destroy();
       throw err;
     }
+
+    this.lastAgentInfo = worker.agentInfo ?? this.lastAgentInfo;
 
     if (this.workers.get(id) !== worker) {
       // Terminated (admin action or shutdown) while it was still starting
