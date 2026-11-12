@@ -57,7 +57,6 @@ export class ToolCallStreamParser {
           // Advance past `<tool_call...>` and switch to BUFFERING_TOOL mode
           this.buffer = this.buffer.slice(tagEndIdx + 1);
           this.mode = "BUFFERING_TOOL";
-          this.hasSeenToolCall = true;
           continue;
         }
 
@@ -88,6 +87,9 @@ export class ToolCallStreamParser {
 
         const parsed = this.parseToolJson(rawInner);
         if (parsed) {
+          // Only a successfully parsed call switches off later chatter; an unparseable block
+          // must not swallow the rest of the reply
+          this.hasSeenToolCall = true;
           this.emitParsedToolCall(parsed, onToolCallDelta);
         } else if (!this.hasSeenToolCall) {
           // If completely unparseable and no valid tool call was seen, fall back to emitting raw text
