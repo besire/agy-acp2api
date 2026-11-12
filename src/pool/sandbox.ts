@@ -148,6 +148,7 @@ export function createWorkerSandbox(workerId: string): WorkerSandboxEnv {
   const absGeminiDir = path.join(geminiBaseDir, relAppDataDir);
   const absAppDataDir = path.join(absGeminiDir, "antigravity-cli");
   fs.mkdirSync(absAppDataDir, { recursive: true });
+  writeSandboxOwner(absGeminiDir);
 
   syncWorkerSandboxAuth(absAppDataDir);
   writeWorkerGatewayCustomizations(absGeminiDir);
@@ -186,17 +187,55 @@ export function cleanupWorkerSandbox(sandbox: WorkerSandboxEnv): void {
 }
 
 /**
- * Sweeps any leftover `agy2api-worker-*` directories from previous ungraceful exits.
+ * Sweeps leftover `agy2api-worker-*` directories from previous ungraceful exits. Another gateway
+ * may be running against the same gemini home, so a sandbox is only removed when its owner
+ * process is gone; unmarked sandboxes (older versions) only once they are a day old.
  */
 export function sweepStaleSandboxes(): void {
   try {
     const geminiBaseDir = runtimePaths.geminiBaseDir;
-    if (fs.existsSync(geminiBaseDir)) {
-      for (const entry of fs.readdirSync(geminiBaseDir)) {
-        if (entry.startsWith("agy2api-worker-")) {
-          fs.rmSync(path.join(geminiBaseDir, entry), { recursive: true, force: true });
-        }
+    if (!fs.existsSync(geminiBaseDir)) return;
+    for (const entry of fs.readdirSync(geminiBaseDir)) {
+      if (!entry.startsWith("agy2api-worker-")) continue;
+      const dir = path.join(geminiBaseDir, entry);
+      if (isSandboxStale(dir)) {
+        fs.rmSync(dir, { recursive: true, force: true });
       }
     }
   } catch {}
+}
+
+const SANDBOX_OWNER_FILE = ".agy2api-owner.json";
+const UNOWNED_SANDBOX_MAX_AGE_MS = 24 * 60 * 60_000;
+
+function writeSandboxOwner(absGeminiDir: string): void {
+  fs.writeFileSync(
+    path.join(absGeminiDir, SANDBOX_OWNER_FILE),
+    JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+    "utf-8"
+  );
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    // EPERM: the process exists but belongs to someone else
+    return err?.code === "EPERM";
+  }
+}
+
+function isSandboxStale(dir: string): boolean {
+  try {
+    const owner = JSON.parse(fs.readFileSync(path.join(dir, SANDBOX_OWNER_FILE), "utf-8"));
+    if (Number.isInteger(owner?.pid)) return !isProcessAlive(owner.pid);
+  } catch {
+    // No (readable) owner file: written by an older version, or still being created
+  }
+  try {
+    return Date.now() - fs.statSync(dir).mtimeMs > UNOWNED_SANDBOX_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
 }
