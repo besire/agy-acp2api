@@ -198,8 +198,8 @@ func (a *App) registration() Registration {
 		Metadata: Metadata{
 			Name:             PluginName,
 			Version:          Version,
-			Author:           "chengdidididi",
-			GitHubRepository: "https://github.com/chengdidididi/agy-acp2api",
+			Author:           "besire",
+			GitHubRepository: "https://github.com/besire/agy-acp2api",
 			ConfigFields: []ConfigField{
 				{
 					Name:        "enabled",

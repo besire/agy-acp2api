@@ -1,31 +1,45 @@
 <div align="center">
   <img src="./assets/icon.svg" width="96" height="96" alt="agy-acp2api icon" />
   <h1>agy-acp2api</h1>
-  <p><b>基于原生 ACP 协议的极简 Antigravity CLI 转 OpenAI v1 API 网关</b></p>
-  <p>零逆向破解 · 原生协议合规中转 · 支持 Agent 工具调用 / 会话缓存复用 / 思考流 / 子代理并发</p>
+  <p><b>基于原生 ACP 协议的 Antigravity CLI 转 OpenAI API 网关</b></p>
+  <p>零逆向破解 · 原生协议中转 · 工具调用 / 会话缓存复用 / 思考流 / Responses API / 图片输入</p>
 </div>
+
+> [!NOTE]
+> 本仓库 fork 自 [chengdidididi/agy-acp2api](https://github.com/chengdidididi/agy-acp2api)。在保持原项目思路（通过官方 `agy acp` 协议中转、不做 OAuth 逆向）的前提下，重点加强了安全性、会话复用的正确性、接口覆盖、上游流量特征和测试，详见[与上游的区别](#与上游的区别)。
 
 ---
 
-## 项目初衷
+## 项目简介
 
-市面上常见的客户端转 API 方案，基本都是基于Oauth的逆向。有一段时间算是相安无事，但是最近封号很多，特别是这段时间的时局因素+gemini ultra 20x极大概率是漏洞，所以需要一种更安全的办法做中转
+常见的客户端转 API 方案大多基于 OAuth 逆向，封号风险越来越高。`agy-acp2api` 换了一条更稳妥的路：
 
-linux.do里的一个项目——[dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) 非常符合当下的需要，但是我不使用dsh，所以就想着搓一个简单的替代品，直接将agy cli的acp协议转成openai标准格式，也当作抛砖引玉、集思广益
-
-**`agy-acp2api` 的核心目标是：用最简单、最干净的方式解决这个问题。**
-
-* **基于官方原生 ACP (Agent Client Protocol) 协议**：直接通过官方 CLI 原生提供的 `agy acp` 标准协议管道进行通信，将标准 OpenAI `/v1/chat/completions` 请求无损翻译并中转给本地 `agy` CLI。
-
-* **完整支持 AI Agent 的绝大多数原生能力**：通过增量提示词编译器与流式状态机，已测试支持外部 Agent 框架所需的以下功能：
-  *  Streaming Tool Calls
-  *  缓存命中
-  *  Sub-Agent 派发 （**注意⚠️，谷歌文件禁止相关自动化流程，故谨慎使用子代理功能**）
+* **基于官方原生 ACP (Agent Client Protocol) 协议**：直接通过官方 CLI 提供的 `agy acp` 标准协议管道通信，把 OpenAI `/v1/chat/completions` 与 `/v1/responses` 请求翻译后交给本地 `agy` CLI，网络层面与单独运行 `agy` 一致。
+* **支持 AI Agent 所需的大部分能力**：通过增量提示词编译器与流式状态机，支持：
+  * Streaming Tool Calls
+  * 会话缓存复用（只发送新增消息）
+  * 思考流（`reasoning_content` / Responses 的 `reasoning` 项）
+  * 图片输入
+  * Sub-Agent 派发（**注意⚠️：谷歌条款禁止相关自动化流程，请谨慎使用子代理功能**）
 
 > [!WARNING]
-> **纯 AI 产出声明 (Vibe Coding Disclaimer)**
-> 
-> 本项目当前版本的代码（从核心状态机、进程池沙箱到内嵌的 Web 控制台 UI） **100% 由 AI 生成**。虽然已构建了一些场景的测试，但仍有待继续改进，将在后续迭代中进行人工 Code Review 与重构精简，也欢迎大家进行贡献和提出问题。
+> **AI 产出声明 (Vibe Coding Disclaimer)**
+>
+> 本项目的代码（包括上游与本 fork 的改动）主要由 AI 生成。已有单元测试、基于模拟 `agy` 的黑盒测试和真实 `agy` 端到端测试覆盖主要场景，但仍可能存在问题，欢迎提 Issue 和 PR。
+
+---
+
+## 与上游的区别
+
+| 方面 | 本 fork 的改动 |
+| :--- | :--- |
+| **安全** | 管理接口必须带 API Key，且不存在 GET 写操作；接口不回传 Key；监听回环地址时校验 `Host` 防 DNS rebinding；监听公网地址且使用默认 Key 时拒绝启动；CPA 插件不再转发 CPA 管理密钥 |
+| **接口** | 新增 [`/v1/responses`](#支持的接口格式)（Codex 等客户端）；[图片输入](#图片输入)以 ACP 图片块交给模型；支持 `stop`；上游 `max_tokens` / 拒答映射为 `length` / `content_filter` |
+| **会话复用** | 会话只能从最新一轮继续（修复重新生成 / 重试时把同一问题追加进旧会话导致的重复上下文）；失败、中断、被截断的轮次立即关闭会话；原会话所在 Worker 忙时先等待而非重放整段历史，详见[会话复用规则](#会话复用规则) |
+| **上游流量** | 默认不再经过本地 Node 代理转发（`AGY2API_MODEL_SNIFFER` 可选开启）；客户端断开后不再发送 prompt；命中 `stop` 立即取消上游；超时 / 失败时发送 `session/cancel` |
+| **稳定性** | 空闲会话按 TTL 关闭、每个 Worker 的会话数有上限；Worker 崩溃按指数退避重启并保留 stderr 便于排查；无可用 Worker 时返回 `503`；多个网关共用同一 `~/.gemini` 时互不清理对方沙箱 |
+| **可观测性** | 控制台显示每个请求未复用会话的原因、无法解析的工具调用数，以及 `agy` 声明的能力（图片 / 音频 / 嵌入资源） |
+| **工程** | 协议无关的核心管线（便于后续接入更多 API 格式）；模拟 `agy` 的黑盒测试与 CI；`start.sh` 只停止本目录的网关并优雅退出；插件仅在打版本 tag 时发布 |
 
 ---
 
@@ -42,7 +56,11 @@ linux.do里的一个项目——[dsh-plugin-bundle](https://github.com/lili-luo/
    * 维护常驻热进程池（默认 `minWorkers=1`，`maxWorkers=2`），消除每次请求冷启动 `agy` 的耗时。
    * 当主 Agent 派生多个并行 Sub-Agent 时，自动在 `maxWorkers` 安全上限内动态扩容独立沙箱副进程，空闲超时（TTL）后自动销毁回收，超出并发上限的请求自动进入内存队列排队，控制因自动化和大数量并发带来的风控风险。
 5. **Web 监控与热配置控制台**
-   * 项目附带可视化仪表盘（默认 `http://127.0.0.1:8787/`），基于 Node.js 原生 `node:sqlite` 持久化统计请求延迟（TTFT / 总耗时）、输入/输出 Token、缓存读取 Token 与缓存命中率、Worker 进程状态，并支持在网页上直接热更新并发上限、API Key 与默认模型。
+   * 项目附带可视化仪表盘（默认 `http://127.0.0.1:8787/`），基于 Node.js 原生 `node:sqlite` 持久化统计请求延迟（TTFT / 总耗时）、输入/输出 Token、缓存读取 Token 与缓存命中率、会话复用情况与未复用原因、Worker 进程状态，并支持在网页上直接热更新并发上限、API Key 与默认模型。
+6. **多种接口格式**
+   * 同时提供 OpenAI Chat Completions 与 Responses API，两者共用同一套会话复用、工具调用与图片处理逻辑。
+7. **CLIProxyAPI (CPA) 插件**
+   * [`cpa-plugin/`](./cpa-plugin/) 把网关包装为 CPA 插件，可在 VPS 上通过 CPA 插件商店安装，详见 [CPA 插件说明](./cpa-plugin/README.md)。
 
 ---
 
@@ -65,7 +83,7 @@ linux.do里的一个项目——[dsh-plugin-bundle](https://github.com/lili-luo/
 ### 2. 获取项目
 
 ```bash
-git clone https://github.com/chengdidididi/agy-acp2api.git
+git clone https://github.com/besire/agy-acp2api.git
 cd agy-acp2api
 ```
 
@@ -249,19 +267,22 @@ npm run test:live   # 连接真实 agy 的端到端测试（消耗账号额度�
 
 ## 后续更新计划 (Roadmap)
 
-本项目目前完成了核心链路闭环（Initial Commit），接下来的迭代重点包括：
-
-- [ ] **适配 CPA (CLIProxyAPI) 插件体系，支持 VPS 云端部署**
-  计划将核心 ACP 协议桥接与会话复用能力封装/适配为 CPA 插件，从而摆脱纯本地桌面环境限制，方便直接部署到远程 **VPS / Linux 服务器** 上统一管理与对外提供服务。
-- [ ] **优化控制台数据展示与细节体验**
-  进一步打磨 Web Dashboard 的监控图表、Token 计费/配额估算展示、错误日志追踪以及异常断线重连等细节。
+- [x] **CPA (CLIProxyAPI) 插件**，支持 VPS 部署（[`cpa-plugin/`](./cpa-plugin/)）
+- [x] **OpenAI Responses API**（`/v1/responses`）
+- [x] **图片输入**
+- [x] **会话复用正确性**、未复用原因统计
+- [ ] **Anthropic Messages API**（`/v1/messages`），供 Claude Code 等客户端直接接入
+- [ ] **原生工具调用**：评估把客户端工具以 MCP 形式交给 `agy`，替代当前基于提示词的 `<tool_call>` 文本协议
+- [ ] **会话持久化**：通过 ACP `session/load` 让网关重启后仍能继续复用会话
+- [ ] **控制台细节**：配额估算、错误日志追踪等
 - [ ] **人工 Code Review 与重构**
 
 ---
 
 ## 特别鸣谢
-- 感谢 [LINUX DO](https://linux.do/) 社区提供交流与开源推广平台
-- [dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle)给我带来的启发
+- 原项目 [chengdidididi/agy-acp2api](https://github.com/chengdidididi/agy-acp2api)，本仓库在其基础上开发
+- [LINUX DO](https://linux.do/) 社区提供交流与开源推广平台
+- [dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) 带来的启发
 
 ## License
 
