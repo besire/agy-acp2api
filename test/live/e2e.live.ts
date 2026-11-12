@@ -1,28 +1,32 @@
+/**
+ * Live end-to-end test against a real, logged-in `agy` (uses your account and quota).
+ * Run with `npm run test:live`; not part of `npm test`.
+ */
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { serve } from "@hono/node-server";
-import { config } from "../src/config.js";
+import { config } from "../../src/config.js";
 import {
   buildUnifiedModelCatalog,
   resolveModelAndThinking,
   stripModelThinkingSuffix,
-} from "../src/compiler/model-resolver.js";
+} from "../../src/compiler/model-resolver.js";
 import {
    TelemetryStore,
   telemetryStore,
-} from "../src/telemetry/metrics-store.js";
-import { ToolCallStreamParser } from "../src/parser/stream-parser.js";
-import { WorkerPool } from "../src/pool/worker-pool.js";
-import { createGatewayApp } from "../src/server/app.js";
+} from "../../src/telemetry/metrics-store.js";
+import { ToolCallStreamParser } from "../../src/parser/stream-parser.js";
+import { WorkerPool } from "../../src/pool/worker-pool.js";
+import { createGatewayApp } from "../../src/server/app.js";
 import {
   OpenAIChatCompletionChunk,
   OpenAIMessage,
   OpenAIToolCallDelta,
   OpenAIToolDefinition,
   OpenAIUsageDetails,
-} from "../src/types/openai.js";
+} from "../../src/types/openai.js";
 
 function testSlidingWindowParserUnit() {
   console.log(
@@ -463,7 +467,9 @@ async function runIntegrationTest() {
     assert.ok(dashHtml.includes("agy2api"));
     assert.ok(dashHtml.includes("顶部 CPA 适配"));
 
-    const overviewRes = await fetch(`${baseUrl}/api/admin/overview`);
+    const overviewRes = await fetch(`${baseUrl}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+    });
     const overview = (await overviewRes.json()) as any;
     assert.ok(["side", "top"].includes(overview.config.uiLayout));
     console.log(
