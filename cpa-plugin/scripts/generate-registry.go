@@ -103,10 +103,10 @@ func main() {
 				ID:          "agy-acp2api",
 				Name:        "agy-acp2api",
 				Description: "Bridges the local Antigravity ACP Gateway (agy-acp2api) and embeds its Material Design 3 web console into CLIProxyAPI.",
-				Author:      "chengdidididi",
+				Author:      "besire",
 				Version:     *version,
-				Repository:  "https://github.com/chengdidididi/agy-acp2api",
-				Homepage:    "https://github.com/chengdidididi/agy-acp2api",
+				Repository:  "https://github.com/besire/agy-acp2api",
+				Homepage:    "https://github.com/besire/agy-acp2api",
 				License:     "MIT",
 				Tags:        []string{"Provider", "Management"},
 				Locales: map[string]PluginLocale{

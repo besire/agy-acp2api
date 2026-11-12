@@ -323,6 +323,8 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   dialog h3 { margin:16px 0 0; font-size:24px; font-weight:400; text-align:center; }
   dialog p { margin:16px 0 0; color:var(--on-surface-variant); text-align:center; word-break:break-all; }
   .dlg-act { display:flex; justify-content:flex-end; gap:8px; margin-top:24px; }
+  #auth-key { display:block; width:100%; box-sizing:border-box; margin-top:16px; height:48px; padding:0 14px; border:0; outline:0; border-radius:4px; box-shadow:inset 0 0 0 1px var(--outline); background:transparent; color:var(--on-surface); font-family:var(--mono); font-size:14px; }
+  #auth-key:focus { box-shadow:inset 0 0 0 2px var(--primary); }
 
   .snack { position:fixed; left:50%; bottom:24px; transform:translate(-50%, 24px); min-width:240px; max-width:560px; padding:14px 16px; border-radius:4px;
            background:var(--inverse-surface); color:var(--inverse-on-surface); box-shadow:0 4px 8px 3px rgba(0,0,0,.15); z-index:50;
@@ -552,6 +554,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   <p id="dlg-p"></p>
   <div class="dlg-act"><button class="btn text" id="dlg-no">取消</button><button class="btn text" id="dlg-ok">确定</button></div>
 </dialog>
+<dialog id="auth-dlg">
+  <div class="dlg-ic"><span class="ms">key</span></div>
+  <h3>输入 API Key</h3>
+  <p>管理接口需要鉴权，请输入网关的 API Key（与 /v1 接口使用的相同）。</p>
+  <input id="auth-key" type="password" autocomplete="off" spellcheck="false" />
+  <div class="dlg-act"><button class="btn text" id="auth-ok">确定</button></div>
+</dialog>
 <div class="snack" id="snack"></div>
 <div class="tip" id="tip"></div>
 
@@ -584,6 +593,40 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     } catch (e) {
       return "";
     }
+  }
+  var ADMIN_KEY_STORE = "agy2api-admin-key";
+  function getAdminKey() { try { return localStorage.getItem(ADMIN_KEY_STORE) || ""; } catch (e) { return ""; } }
+  function setAdminKey(k) { try { if (k) localStorage.setItem(ADMIN_KEY_STORE, k); else localStorage.removeItem(ADMIN_KEY_STORE); } catch (e) {} }
+  function authHeaders() {
+    var h = {};
+    var mgmtKey = getCpaManagementKey();
+    if (mgmtKey) h["Authorization"] = "Bearer " + mgmtKey;
+    var k = getAdminKey();
+    if (k) h["X-Agy2Api-Key"] = k;
+    return h;
+  }
+  var authPending = null;
+  function askAdminKey() {
+    if (authPending) return authPending;
+    authPending = new Promise(function (res) {
+      var d = $("auth-dlg"), inp = $("auth-key");
+      inp.value = "";
+      var done = function () {
+        var v = inp.value.trim();
+        if (!v) { inp.focus(); return; }
+        setAdminKey(v);
+        $("auth-ok").onclick = null; inp.onkeydown = null; d.oncancel = null;
+        if (d.open) d.close();
+        authPending = null;
+        res(v);
+      };
+      $("auth-ok").onclick = done;
+      inp.onkeydown = function (e) { if (e.key === "Enter") done(); };
+      d.oncancel = function (e) { e.preventDefault(); };
+      d.showModal();
+      inp.focus();
+    });
+    return authPending;
   }
   function resolveApiUrl(relPath) {
     var p = relPath.replace(/^\.?\//, "");
@@ -653,15 +696,18 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return '<span class="chip mono ' + (big ? "lg " : "") + (t ? "t-warn" : "t-plain") + '" data-tip="' + (t ? "trial 路由" : "上游模型") + '">' +
       (t ? '<span class="ms">warning</span>' : "") + esc(m || "–") + "</span>";
   }
-  function sessChip(hit, sid) {
+  var MISS_REASONS = { new_conversation: "新对话", no_match: "历史不匹配", worker_busy: "原进程忙，等待超时" };
+  function missName(reason) { return MISS_REASONS[reason] || reason || ""; }
+  function sessChip(hit, sid, reason) {
     return hit
       ? '<span class="chip t-primary" data-tip="会话复用"><span class="ms">link</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>"
-      : '<span class="chip t-tertiary" data-tip="新会话"><span class="ms">fiber_new</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>";
+      : '<span class="chip t-tertiary" data-tip="' + esc("新会话" + (reason ? " · " + missName(reason) : "")) + '"><span class="ms">fiber_new</span><span class="mono">' + esc(sid.slice(0, 6)) + "</span></span>";
   }
   function finish(r) {
     if (r.status === "error") return '<span class="ms fill c-err" data-tip="' + esc(r.errorMessage || "error") + '">error</span>';
     if (r.finishReason === "tool_calls") return '<span class="chip t-warn" data-tip="工具调用"><span class="ms">build</span>' + r.toolCallsCount + "</span>";
     if (r.finishReason === "length") return '<span class="ms c-slow" data-tip="长度截断">content_cut</span>';
+    if (r.finishReason === "content_filter") return '<span class="ms c-err" data-tip="模型拒绝回答">block</span>';
     return '<span class="ms fill c-ok" data-tip="完成">check_circle</span>';
   }
   function ring(p, size, sw, color) {
@@ -746,8 +792,26 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
       (p.startingWorkers ? '<span class="chip t-warn" data-tip="启动中"><span class="dot warn"></span>' + p.startingWorkers + "</span>" : "") +
       '<span class="grow"></span>' +
       '<span class="chip ' + (p.queuedRequests ? "t-err" : "t-plain") + '" data-tip="排队请求"><span class="ms">hourglass_top</span>' + p.queuedRequests + "</span>" +
+      (p.affinityWaiters ? '<span class="chip t-warn" data-tip="等待原会话进程空闲"><span class="ms">link</span>' + p.affinityWaiters + "</span>" : "") +
       '<span class="chip t-plain" data-tip="会话哈希"><span class="ms">tag</span>' + p.cachedSessionHashes + "</span>" +
       '<span class="chip t-plain" data-tip="常驻 – 上限"><span class="ms">width</span>' + d.config.minWorkers + "–" + d.config.maxWorkers + "</span>" +
+      "</div>";
+  }
+  // What agy declared in ACP initialize; null until a worker has started
+  function agentMeta(d) {
+    var a = d.agent;
+    if (!a) return "";
+    var info = a.agentInfo || {}, pc = (a.agentCapabilities || {}).promptCapabilities || {};
+    var name = (info.title || info.name || "agy") + (info.version ? " " + info.version : "");
+    function cap(on, icon, label) {
+      return '<span class="chip ' + (on ? "t-ok" : "t-plain") + '" data-tip="' + label + (on ? " · 支持" : " · 不支持") + '">' +
+        '<span class="ms">' + (on ? icon : "block") + "</span>" + label + "</span>";
+    }
+    return '<div class="pool-meta">' +
+      '<span class="chip t-plain" data-tip="上游 Agent"><span class="ms">smart_toy</span>' + esc(name) + "</span>" +
+      '<span class="chip t-plain" data-tip="ACP 协议版本"><span class="ms">swap_horiz</span>ACP v' + esc(a.protocolVersion) + "</span>" +
+      '<span class="grow"></span>' +
+      cap(pc.image, "image", "图片输入") + cap(pc.audio, "mic", "音频输入") + cap(pc.embeddedContext, "description", "嵌入资源") +
       "</div>";
   }
 
@@ -759,17 +823,19 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   function renderHome(d) {
     var s = d.telemetry.summary, reqs = d.telemetry.recentRequests, chrono = reqs.slice().reverse();
     var okRate = s.totalRequests ? (s.successfulRequests / s.totalRequests) * 100 : 0;
+    var misses = Object.keys(s.missReasons || {}).map(function (k) { return missName(k) + " " + num(s.missReasons[k]); });
     var html =
       kpi("bolt", "t-primary", "请求",
         '<span class="kpi-val">' + (s.totalRequests >= 10000 ? tok(s.totalRequests) : num(s.totalRequests)) + "</span>" + ring(okRate, 48, 5, "var(--success)"),
         '<span class="chip t-ok" data-tip="成功"><span class="ms">check</span>' + num(s.successfulRequests) + "</span>" +
-        '<span class="chip ' + (s.failedRequests ? "t-err" : "t-plain") + '" data-tip="失败"><span class="ms">close</span>' + num(s.failedRequests) + "</span>") +
+        '<span class="chip ' + (s.failedRequests ? "t-err" : "t-plain") + '" data-tip="失败"><span class="ms">close</span>' + num(s.failedRequests) + "</span>" +
+        (s.toolParseFailures ? '<span class="chip t-warn" data-tip="无法解析的工具调用"><span class="ms">build</span>' + num(s.toolParseFailures) + "</span>" : "")) +
       kpi("timer", "t-secondary", "平均 TTFT",
         '<span class="kpi-val ' + tone(s.avgTtftMs) + '">' + ms(s.avgTtftMs) + "</span>",
         '<div style="flex:1" data-tip="最近 30 次">' + spark(chrono.slice(-30).map(function (r) { return r.ttftMs || 0; })) + "</div>") +
       kpi("cached", "t-tertiary", "缓存命中",
         '<span class="kpi-val">' + pct(s.cloudCacheHitRate) + "</span>" + ring(s.cloudCacheHitRate, 48, 5),
-        '<span class="ms" data-tip="会话复用率" style="font-size:16px">link</span><div class="lin ok" style="flex:1"><i style="width:' + s.sessionHashHitRate + '%"></i></div><span class="mono">' + pct(s.sessionHashHitRate) + "</span>") +
+        '<span class="ms" data-tip="' + esc(["会话复用率"].concat(misses).join("\n")) + '" style="font-size:16px">link</span><div class="lin ok" style="flex:1"><i style="width:' + s.sessionHashHitRate + '%"></i></div><span class="mono">' + pct(s.sessionHashHitRate) + "</span>") +
       kpi("token", "t-ok", "Token",
         '<span class="kpi-val">' + tok(s.totalTokens) + "</span>",
         '<div style="flex:1" data-tip="' + esc("缓存 " + tok(s.totalCachedReadTokens) + "\n输入 " + tok(s.totalInputTokens + s.totalCachedWriteTokens) +
@@ -835,7 +901,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         rows.map(function (r) {
           return '<tr data-act="open-req" data-id="' + esc(r.requestId) + '">' +
             '<td class="mono muted">' + clock(r.timestamp) + "</td>" +
-            "<td>" + sessChip(r.sessionCache === "HIT", r.sessionId) + "</td>" +
+            "<td>" + sessChip(r.sessionCache === "HIT", r.sessionId, r.missReason) + "</td>" +
             '<td><span class="model">' + esc(r.resolvedBaseModel) + lv(r.thinkingLevel) + "</span></td>" +
             "<td>" + upChip(r.actualModelVersion) + "</td>" +
             '<td class="r mono ' + tone(r.ttftMs) + '">' + ms(r.ttftMs) + "</td>" +
@@ -868,7 +934,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
 
   function renderRuntime(d) {
     var now = Date.now();
-    $("rt-pool").innerHTML = slots(d) + poolMeta(d);
+    $("rt-pool").innerHTML = slots(d) + poolMeta(d) + agentMeta(d);
 
     if (!d.workers.length) $("rt-workers").innerHTML = '<div class="card">' + empty("memory", "无进程") + "</div>";
     else $("rt-workers").innerHTML = d.workers.map(function (w) {
@@ -952,7 +1018,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     if (S.cfgReady && S.dirty) return;
     if (S.cfgReady) return;
     setDirty(false);
-    $("f-apiKey").value = c.apiKey || "";
+    $("f-apiKey").value = getAdminKey();
     $("f-model").value = c.defaultModel;
     S.level = c.defaultThinkingLevel || "medium";
     renderLevel();
@@ -983,6 +1049,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     };
     if (!p.apiKey) { snack("API Key 不能为空", true); return; }
     await api("POST", "./api/admin/config", p);
+    setAdminKey(p.apiKey);
     setDirty(false);
     S.cfgReady = false;
     snack("已保存");
@@ -1015,10 +1082,13 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
         stack(tokParts(r), 12) + tokLegend(r) +
         '<div class="kv" style="margin-top:8px"><span>命中</span><span class="cachecell">' + ring(r.cacheHitRate, 22, 3) + '<span class="mono">' + pct(r.cacheHitRate) + "</span></span></div>") +
       sec("forum", "会话",
-        kv("会话", '<span data-act="open-sess" data-id="' + esc(r.sessionId) + '" style="cursor:pointer">' + sessChip(r.sessionCache === "HIT", r.sessionId) + "</span>") +
+        kv("会话", '<span data-act="open-sess" data-id="' + esc(r.sessionId) + '" style="cursor:pointer">' + sessChip(r.sessionCache === "HIT", r.sessionId, r.missReason) + "</span>") +
+        (r.sessionCache !== "HIT" && r.missReason ? kv("未复用", esc(missName(r.missReason))) : "") +
         kv("进程", '<span class="mono">' + esc(r.workerId) + "</span>") +
         kv("传输", '<span class="chip t-plain">' + (r.stream ? "SSE" : "JSON") + "</span>")) +
-      sec("flag", "结果", kv(esc(r.finishReason || "stop"), finish(r)) + (r.errorMessage ? '<div class="err-box">' + esc(r.errorMessage) + "</div>" : "")) +
+      sec("flag", "结果", kv(esc(r.finishReason || "stop"), finish(r)) +
+        (r.toolParseFailures ? kv("工具解析失败", '<span class="mono c-slow">' + r.toolParseFailures + "</span>") : "") +
+        (r.errorMessage ? '<div class="err-box">' + esc(r.errorMessage) + "</div>" : "")) +
       '<div class="mono muted" style="font-size:11px">' + esc(r.requestId) + "</div>";
   }
   function sessSheet(s, d) {
@@ -1079,9 +1149,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     return baseDir + p;
   }
   async function api(method, url, body) {
-    var hdrs = {};
-    var mgmtKey = getCpaManagementKey();
-    if (mgmtKey) hdrs["Authorization"] = "Bearer " + mgmtKey;
+    var hdrs = authHeaders();
     var isCpaResource = location.pathname.indexOf("/v0/resource/plugins/") === 0;
     var r;
     if (isCpaResource && method !== "GET") {
@@ -1096,6 +1164,7 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
     }
     var j = {};
     try { j = await r.json(); } catch (e) {}
+    if (r.status === 401) { askAdminKey().then(poll); throw new Error("API Key 无效或缺失"); }
     if (!r.ok || j.status === "error" || j.status === "not_found") throw new Error(j.message || j.status || "HTTP " + r.status);
     return j;
   }
@@ -1164,10 +1233,9 @@ const DASHBOARD_HTML = String.raw`<!DOCTYPE html>
   }
   async function poll() {
     try {
-      var hdrs = {};
-      var mgmtKey = getCpaManagementKey();
-      if (mgmtKey) hdrs["Authorization"] = "Bearer " + mgmtKey;
+      var hdrs = authHeaders();
       var r = await fetch(resolveApiUrl("./api/admin/overview"), { cache: "no-store", headers: Object.keys(hdrs).length ? hdrs : undefined });
+      if (r.status === 401) { setSync(false); await askAdminKey(); return poll(); }
       if (!r.ok) throw new Error("HTTP " + r.status);
       S.d = await r.json();
       S.last = Date.now();

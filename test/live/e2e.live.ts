@@ -1,36 +1,46 @@
+/**
+ * Live end-to-end test against a real, logged-in `agy` (uses your account and quota).
+ * Run with `npm run test:live`; not part of `npm test`.
+ */
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { serve } from "@hono/node-server";
-import { config } from "../src/config.js";
+import { config } from "../../src/config.js";
 import {
   buildUnifiedModelCatalog,
   resolveModelAndThinking,
   stripModelThinkingSuffix,
-} from "../src/compiler/model-resolver.js";
+} from "../../src/compiler/model-resolver.js";
 import {
    TelemetryStore,
   telemetryStore,
-} from "../src/telemetry/metrics-store.js";
-import { ToolCallStreamParser } from "../src/parser/stream-parser.js";
-import { WorkerPool } from "../src/pool/worker-pool.js";
-import { createGatewayApp } from "../src/server/app.js";
+} from "../../src/telemetry/metrics-store.js";
+import { ToolCall } from "../../src/core/chat.js";
+import { ToolCallStreamParser } from "../../src/parser/stream-parser.js";
+import { reasoningEffortFromBody } from "../../src/protocols/openai/chat-completions.js";
+import { WorkerPool } from "../../src/pool/worker-pool.js";
+import { createGatewayApp } from "../../src/server/app.js";
 import {
   OpenAIChatCompletionChunk,
   OpenAIMessage,
   OpenAIToolCallDelta,
   OpenAIToolDefinition,
   OpenAIUsageDetails,
-} from "../src/types/openai.js";
+} from "../../src/types/openai.js";
 
 function testSlidingWindowParserUnit() {
   console.log(
     "1. [Unit Test] Testing ToolCallStreamParser sliding window & partial prefix holdback..."
   );
-  const parser = new ToolCallStreamParser();
   const emittedText: string[] = [];
-  const emittedTools: OpenAIToolCallDelta[] = [];
+  const emittedTools: ToolCall[] = [];
+  const parser = new ToolCallStreamParser((ev) => {
+    if (ev.type === "text") emittedText.push(ev.text);
+    else emittedTools.push(ev.call);
+  });
 
   const chunks = [
     "Hello! I will check <div> and then call a tool: <",
@@ -42,29 +52,33 @@ function testSlidingWindowParserUnit() {
   ];
 
   for (const c of chunks) {
-    parser.feed(
-      c,
-      (txt) => emittedText.push(txt),
-      (tc) => emittedTools.push(tc)
-    );
+    parser.feed(c);
   }
-  const finishReason = parser.flush(
-    (txt) => emittedText.push(txt),
-    (tc) => emittedTools.push(tc)
-  );
+  const finishReason = parser.flush();
 
   assert.equal(
     emittedText.join(""),
     "Hello! I will check <div> and then call a tool: "
   );
   assert.equal(emittedTools.length, 1);
-  assert.equal(emittedTools[0].function?.name, "calculate_sum");
+  assert.equal(emittedTools[0].name, "calculate_sum");
   assert.deepEqual(
-    JSON.parse(emittedTools[0].function?.arguments || "{}"),
+    JSON.parse(emittedTools[0].arguments || "{}"),
     { a: 10, b: 25 }
   );
   assert.equal(finishReason, "tool_calls");
   console.log("   -> Passed! Sliding window parser verified.");
+}
+
+// Resolves an OpenAI-style body the way the chat endpoint does
+function resolveModelAndThinkingFromBody(
+  body: { model: string; messages: unknown[] } & Parameters<typeof reasoningEffortFromBody>[0],
+  rawModels: Parameters<typeof resolveModelAndThinking>[1]
+) {
+  return resolveModelAndThinking(
+    { model: body.model, effort: reasoningEffortFromBody(body) },
+    rawModels
+  );
 }
 
 function testUnifiedModelAndEffortResolverUnit() {
@@ -92,7 +106,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.deepEqual(argon.thinkingLevels, ["low", "medium", "high"]);
 
   // Test 1: Base model + reasoning_effort (Carbon & Argon)
-  const rc1 = resolveModelAndThinking(
+  const rc1 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon", reasoning_effort: "high", messages: [] },
     sampleRaw
   );
@@ -100,7 +114,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc1.thinkingLevel, "high");
   assert.equal(rc1.acpModelId, "gemini-4-carbon-high");
 
-  const rc2 = resolveModelAndThinking(
+  const rc2 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon(low)", messages: [] },
     sampleRaw
   );
@@ -108,7 +122,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc2.thinkingLevel, "low");
   assert.equal(rc2.acpModelId, "gemini-4-carbon-low");
 
-  const rc3 = resolveModelAndThinking(
+  const rc3 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-carbon:medium", messages: [] },
     sampleRaw
   );
@@ -116,7 +130,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(rc3.thinkingLevel, "medium");
   assert.equal(rc3.acpModelId, "gemini-4-carbon-medium");
 
-  const r1 = resolveModelAndThinking(
+  const r1 = resolveModelAndThinkingFromBody(
     { model: "gemini-4-argon", reasoning_effort: "high", messages: [] },
     sampleRaw
   );
@@ -125,7 +139,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r1.acpModelId, "gemini-4-argon-high");
 
   // Test 2: Model with bracket syntax `gemini-3.8-flash(low)`
-  const r2 = resolveModelAndThinking(
+  const r2 = resolveModelAndThinkingFromBody(
     { model: "gemini-3.8-flash(low)", messages: [] },
     sampleRaw
   );
@@ -134,7 +148,7 @@ function testUnifiedModelAndEffortResolverUnit() {
   assert.equal(r2.acpModelId, "gemini-3.8-flash-low");
 
   // Test 3: Model with thinking.budget_tokens
-  const r3 = resolveModelAndThinking(
+  const r3 = resolveModelAndThinkingFromBody(
     {
       model: "gemini-4-argon",
       thinking: { type: "enabled", budget_tokens: 32000 },
@@ -196,6 +210,34 @@ function testUnifiedModelAndEffortResolverUnit() {
   console.log(
     "   -> Passed! SQLite WAL persistence, unified base models, suffix stripping & bounded cache hit rate (90.0%) verified."
   );
+}
+
+/** A solid-colour RGB PNG, so the live test needs no image fixtures. */
+function solidPng(size: number, rgb: [number, number, number]): Buffer {
+  const stride = size * 3 + 1;
+  const raw = Buffer.alloc(stride * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) raw.set(rgb, y * stride + 1 + x * 3);
+  }
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(zlib.crc32(body));
+    return Buffer.concat([len, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: RGB
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", zlib.deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
 async function consumeSseStream(res: Response): Promise<{
@@ -463,7 +505,9 @@ async function runIntegrationTest() {
     assert.ok(dashHtml.includes("agy2api"));
     assert.ok(dashHtml.includes("顶部 CPA 适配"));
 
-    const overviewRes = await fetch(`${baseUrl}/api/admin/overview`);
+    const overviewRes = await fetch(`${baseUrl}/api/admin/overview`, {
+      headers: { Authorization: `Bearer ${config.apiKey}` },
+    });
     const overview = (await overviewRes.json()) as any;
     assert.ok(["side", "top"].includes(overview.config.uiLayout));
     console.log(
@@ -488,6 +532,91 @@ async function runIntegrationTest() {
     assert.ok(
       overview.telemetry.recentRequests[1].actualModelVersion.includes("gemini-3.8-flash")
     );
+
+    console.log("\n8. [E2E Image Input via /v1/responses] Asking the model for the colour of a generated PNG...");
+    assert.equal(
+      overview.agent?.agentCapabilities?.promptCapabilities?.image,
+      true,
+      "agy should declare image prompt support"
+    );
+    const red = solidPng(64, [220, 20, 20]).toString("base64");
+    const imageRes = await fetch(`${baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash",
+        reasoning: { effort: "low" },
+        store: false,
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "What colour fills this image? Answer with one English word." },
+              { type: "input_image", image_url: `data:image/png;base64,${red}` },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(imageRes.status, 200);
+    const imageJson = (await imageRes.json()) as any;
+    const answer = imageJson.output
+      .filter((item: any) => item.type === "message")
+      .map((item: any) => item.content[0].text)
+      .join("");
+    console.log("   -> Answer:", JSON.stringify(answer));
+    console.log("   -> Usage:", JSON.stringify(imageJson.usage));
+    assert.match(answer, /red/i);
+
+    console.log("\n9. [E2E Regenerate] Re-sending Turn 2 must not be appended to the session that already answered it...");
+    const regenRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({ model: "gemini-3.8-flash(low)", messages, tools, stream: false }),
+    });
+    assert.equal(regenRes.status, 200);
+    const regenCache = regenRes.headers.get("X-Agy2Api-Session-Cache");
+    const regenSession = regenRes.headers.get("X-Agy2Api-Session-Id");
+    const regenJson = (await regenRes.json()) as any;
+    console.log(`   -> Headers: Cache=${regenCache}, SessionId=${regenSession}`);
+    console.log("   -> Content:", JSON.stringify(regenJson.choices[0].message.content));
+    assert.equal(regenCache, "MISS");
+    assert.notEqual(regenSession, sessionId1);
+    // The full transcript (including the tool result) was replayed into the new session
+    assert.ok(String(regenJson.choices[0].message.content).includes("OMEGA-SH-7749"));
+
+    console.log("\n10. [E2E Stop Sequence] Counting with stop=[\"7\"] must end before the 7...");
+    const stopRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gemini-3.8-flash",
+        reasoning_effort: "low",
+        stop: ["7"],
+        stream: true,
+        messages: [
+          {
+            role: "user",
+            content: "Count from 1 to 20 in digits, separated by commas, nothing else.",
+          },
+        ],
+      }),
+    });
+    assert.equal(stopRes.status, 200);
+    const stopped = await consumeSseStream(stopRes);
+    console.log("   -> Content:", JSON.stringify(stopped.content), "finish:", stopped.finishReason);
+    assert.equal(stopped.finishReason, "stop");
+    assert.match(stopped.content, /6/);
+    assert.ok(!stopped.content.includes("7"), "nothing after the stop sequence");
 
     console.log("\nALL UNIT & E2E TESTS PASSED SUCCESSFULLY!");
   } finally {

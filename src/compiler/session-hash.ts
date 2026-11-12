@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { OpenAIMessage, OpenAIToolDefinition } from "../types/openai.js";
+import { ChatMessage, ContentPart, textOf, ToolDefinition } from "../core/chat.js";
 
 export interface SessionAffinityEntry {
   hash: string;
@@ -12,19 +12,12 @@ export interface SessionAffinityEntry {
 
 export interface PrefixMatchResult {
   entry: SessionAffinityEntry;
-  deltaMessages: OpenAIMessage[];
+  deltaMessages: ChatMessage[];
   matchedPrefixLength: number;
 }
 
-export function extractTextContent(content: OpenAIMessage["content"]): string {
-  if (!content) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (part.type === "text" ? part.text || "" : ""))
-      .join("\n");
-  }
-  return String(content);
+function sha256(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
 }
 
 function sortJsonDeep(val: unknown): unknown {
@@ -51,54 +44,64 @@ export function canonicalizeJsonString(raw: string | undefined): string {
   }
 }
 
-export function canonicalizeMessage(msg: OpenAIMessage): Record<string, unknown> {
-  const role = msg.role === "developer" ? "system" : msg.role;
-  const text = extractTextContent(msg.content).trim();
+/** Images are identified by a digest of their bytes (or URL) so the hash stays small. */
+function imageDigests(content: ContentPart[]): string[] {
+  return content.flatMap((part) =>
+    part.type === "image" ? [sha256(part.data ?? part.url ?? "")] : []
+  );
+}
 
-  if (role === "assistant") {
-    const toolCalls = (msg.tool_calls || []).map((tc) => ({
-      name: tc.function?.name || "",
-      arguments: canonicalizeJsonString(tc.function?.arguments),
-    }));
-    return {
-      role: "assistant",
-      content: text,
-      toolCalls,
-    };
-  }
-
-  if (role === "tool") {
-    return {
-      role: "tool",
-      content: text,
-    };
-  }
-
-  return {
-    role,
-    content: text,
+/**
+ * Reduces a message to what matters for session reuse: tool-call ids, JSON key order and
+ * surrounding whitespace are ignored.
+ */
+export function canonicalizeMessage(msg: ChatMessage): Record<string, unknown> {
+  const canonical: Record<string, unknown> = {
+    role: msg.role,
+    content: textOf(msg.content).trim(),
   };
+  if (msg.role === "assistant") {
+    canonical.toolCalls = msg.toolCalls.map((tc) => ({
+      name: tc.name,
+      arguments: canonicalizeJsonString(tc.arguments),
+    }));
+  }
+  const images = imageDigests(msg.content);
+  if (images.length > 0) {
+    canonical.images = images;
+  }
+  return canonical;
+}
+
+/**
+ * Hash chain over the conversation: element `k` identifies the first `k` messages under the given
+ * model and tool set. Each step only hashes one message, so all prefixes cost O(n) together.
+ */
+export function prefixHashes(
+  baseModelId: string,
+  tools: ToolDefinition[],
+  messages: ChatMessage[]
+): string[] {
+  const canonicalTools = tools.map((t) => ({
+    name: t.name,
+    parameters: sortJsonDeep(t.parameters || {}),
+  }));
+  let hash = sha256(JSON.stringify({ model: baseModelId, tools: canonicalTools }));
+  const hashes = [hash];
+  for (const msg of messages) {
+    hash = sha256(hash + JSON.stringify(canonicalizeMessage(msg)));
+    hashes.push(hash);
+  }
+  return hashes;
 }
 
 export function computeConversationHash(
   baseModelId: string,
-  tools: OpenAIToolDefinition[] | undefined,
-  messages: OpenAIMessage[]
+  tools: ToolDefinition[],
+  messages: ChatMessage[]
 ): string {
-  const canonicalTools = (tools || []).map((t) => ({
-    name: t.function.name,
-    parameters: sortJsonDeep(t.function.parameters || {}),
-  }));
-
-  const canonicalMessages = messages.map(canonicalizeMessage);
-
-  const payload = JSON.stringify({
-    model: baseModelId,
-    tools: canonicalTools,
-    messages: canonicalMessages,
-  });
-
-  return crypto.createHash("sha256").update(payload).digest("hex");
+  const hashes = prefixHashes(baseModelId, tools, messages);
+  return hashes[hashes.length - 1];
 }
 
 export class SessionAffinityRegistry {
@@ -119,26 +122,25 @@ export class SessionAffinityRegistry {
   }
 
   /**
-   * Scans backwards for the longest prefix ending in an assistant message
-   * that matches an existing session on a currently IDLE worker.
+   * Scans backwards for the longest prefix ending in an assistant message that is the current
+   * head of a session accepted by `isWorkerAvailable`.
    */
   public findBestMatchingPrefix(
     baseModelId: string,
-    tools: OpenAIToolDefinition[] | undefined,
-    messages: OpenAIMessage[],
+    tools: ToolDefinition[],
+    messages: ChatMessage[],
     isWorkerAvailable: (workerId: string, sessionId: string) => boolean
   ): PrefixMatchResult | null {
     this.pruneExpired();
+    if (this.entries.size === 0) return null;
 
+    const hashes = prefixHashes(baseModelId, tools, messages);
     for (let k = messages.length - 1; k >= 2; k--) {
       if (messages[k - 1].role !== "assistant") {
         continue;
       }
 
-      const prefix = messages.slice(0, k);
-      const candidateHash = computeConversationHash(baseModelId, tools, prefix);
-      const entry = this.entries.get(candidateHash);
-
+      const entry = this.entries.get(hashes[k]);
       if (entry && isWorkerAvailable(entry.workerId, entry.sessionId)) {
         entry.updatedAt = Date.now();
         return {
@@ -152,10 +154,24 @@ export class SessionAffinityRegistry {
     return null;
   }
 
+  /**
+   * Takes a matched session off the registry before a prompt is sent to it: its history is about
+   * to grow, so no other request may extend the old head (that would replay this turn to it).
+   */
+  public claim(entry: SessionAffinityEntry): void {
+    this.removeSession(entry.sessionId);
+  }
+
+  /** Undoes `claim` when the prompt was never sent. */
+  public restore(entry: SessionAffinityEntry): void {
+    this.entries.set(entry.hash, { ...entry, updatedAt: Date.now() });
+  }
+
+  /** Records the session's new head; older heads of the same session no longer match. */
   public registerTurnState(
     baseModelId: string,
-    tools: OpenAIToolDefinition[] | undefined,
-    fullMessagesWithReply: OpenAIMessage[],
+    tools: ToolDefinition[],
+    fullMessagesWithReply: ChatMessage[],
     workerId: string,
     sessionId: string
   ): string {
@@ -164,6 +180,7 @@ export class SessionAffinityRegistry {
       tools,
       fullMessagesWithReply
     );
+    this.removeSession(sessionId);
     this.entries.set(hash, {
       hash,
       workerId,

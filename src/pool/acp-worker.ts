@@ -5,6 +5,8 @@ import { config } from "../config.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import {
   AcpConfigOption,
+  AcpContentBlock,
+  AcpInitializeResult,
   AcpModelInfo,
   AcpPromptResult,
   AcpSessionNewResult,
@@ -32,6 +34,13 @@ export interface ExtendedPromptExecutionResult extends AcpPromptResult {
   actualModelVersion: string;
 }
 
+export interface AcpWorkerHooks {
+  /** Fired once when the `agy` process dies on its own (not after `destroy()`). */
+  onDeath?: (worker: AcpWorker, err: Error) => void;
+  /** Fired whenever an ACP session on this worker is closed (TTL, eviction, admin). */
+  onSessionClosed?: (sessionId: string) => void;
+}
+
 interface PendingRpc {
   resolve: (val: any) => void;
   reject: (err: Error) => void;
@@ -40,13 +49,31 @@ interface PendingRpc {
 
 export type WorkerState = "STARTING" | "IDLE" | "BUSY" | "DEAD";
 
+/**
+ * `AGY2API_MODEL_SNIFFER=1` proxies agy's backend traffic through a local sniffer to read the
+ * model version that actually answered.
+ */
+export function modelSnifferEnabled(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env.AGY2API_MODEL_SNIFFER?.trim() ?? "");
+}
+
+/** The turn was abandoned before `session/prompt` went out; the session is unchanged. */
+export class PromptNotSentError extends Error {}
+
+const STDERR_TAIL_LIMIT = 4096;
+// After `exit`, wait this long for stdio to drain so the stderr tail is complete
+const EXIT_DRAIN_GRACE_MS = 250;
+
 export class AcpWorker {
   public readonly id: string;
   public readonly sandbox: WorkerSandboxEnv;
   public readonly createdAt: number = Date.now();
+  public readyAt: number | null = null;
   public state: WorkerState = "STARTING";
   public lastUsedAt: number = Date.now();
   public availableModels: AcpModelInfo[] = [];
+  /** The agent's `initialize` response (protocol version, prompt capabilities, agent info). */
+  public agentInfo: AcpInitializeResult | null = null;
   public totalRequestsHandled: number = 0;
 
   private proc: ChildProcessWithoutNullStreams | null = null;
@@ -54,36 +81,42 @@ export class AcpWorker {
   private rpcIdCounter = 1;
   private pendingRpcs = new Map<number | string, PendingRpc>();
   private activeStreamListeners = new Map<string, PromptStreamCallbacks>();
-  private activeSessions = new Set<string>();
+  // sessionId -> last time a prompt started or finished on it
+  private sessionLastUsedAt = new Map<string, number>();
   private sessionAssignedModel = new Map<string, string>();
   private sessionConfirmedConfig = new Map<
     string,
     { model: string; thoughtLevel: string }
   >();
-  private onDeathCallback?: (workerId: string) => void;
+  private stderrTail = "";
+  private hooks: AcpWorkerHooks;
 
-  constructor(id: string, onDeath?: (workerId: string) => void) {
+  constructor(id: string, hooks: AcpWorkerHooks = {}) {
     this.id = id;
     this.sandbox = createWorkerSandbox(id);
-    this.onDeathCallback = onDeath;
+    this.hooks = hooks;
   }
 
   public async start(): Promise<void> {
-    const snifferPort = await this.sniffer.start((detectedVer) => {
-      const cleanVer = stripModelThinkingSuffix(detectedVer);
-      for (const listener of this.activeStreamListeners.values()) {
-        listener.onActualModelDetected?.(cleanVer);
-      }
-    });
-
     const args = [
       "acp",
       "--sandbox",
       "--include-default-customizations=false",
       `--gemini-dir=${this.sandbox.absGeminiDir}`,
       `--agent=${this.sandbox.agentName}`,
-      `--cloud_code_endpoint=http://127.0.0.1:${snifferPort}`,
     ];
+
+    // Opt-in: routing agy's traffic through a local Node proxy changes what Google sees on the
+    // wire (TLS stack, HTTP/1.1), so by default agy talks to its backend directly
+    if (modelSnifferEnabled()) {
+      const snifferPort = await this.sniffer.start((detectedVer) => {
+        const cleanVer = stripModelThinkingSuffix(detectedVer);
+        for (const listener of this.activeStreamListeners.values()) {
+          listener.onActualModelDetected?.(cleanVer);
+        }
+      });
+      args.push(`--cloud_code_endpoint=http://127.0.0.1:${snifferPort}`);
+    }
 
     const childEnv: NodeJS.ProcessEnv = {
       ...process.env,
@@ -92,25 +125,44 @@ export class AcpWorker {
         : {}),
     };
 
-    this.proc = spawn(config.agyBin, args, {
+    const proc = spawn(config.agyBin, args, {
       cwd: this.sandbox.jailCwd,
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+    this.proc = proc;
 
-    this.proc.on("exit", () => {
+    // Writes racing a dying process raise EPIPE on stdin; without a listener that would crash the gateway
+    proc.stdin.on("error", () => {});
+
+    proc.on("exit", (code, signal) => {
+      const die = () =>
+        this.handleProcessDeath(
+          new Error(
+            `Worker ${this.id} exited unexpectedly (code=${code ?? "null"}, signal=${
+              signal ?? "null"
+            })${this.formatStderrTail()}`
+          )
+        );
+      const fallback = setTimeout(die, EXIT_DRAIN_GRACE_MS);
+      fallback.unref?.();
+      proc.once("close", () => {
+        clearTimeout(fallback);
+        die();
+      });
+    });
+
+    proc.on("error", (err) => {
       this.handleProcessDeath(
-        new Error(`Worker ${this.id} process exited unexpectedly`)
+        new Error(
+          `Worker ${this.id} failed to run '${config.agyBin}': ${err.message}`
+        )
       );
     });
 
-    this.proc.on("error", (err) => {
-      this.handleProcessDeath(err);
-    });
-
     const rl = readline.createInterface({
-      input: this.proc.stdout,
+      input: proc.stdout,
       crlfDelay: Infinity,
     });
 
@@ -118,16 +170,28 @@ export class AcpWorker {
       this.handleStdoutLine(line);
     });
 
-    // Drain stderr silently so pipe never blocks
-    this.proc.stderr.on("data", () => {});
-
-    // Perform ACP JSON-RPC handshake
-    await this.sendRpc("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {},
+    // Keep only the tail of stderr so crash reasons can be surfaced without unbounded memory
+    proc.stderr.setEncoding("utf-8");
+    proc.stderr.on("data", (chunk: string) => {
+      this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
     });
 
+    // Perform ACP JSON-RPC handshake
+    try {
+      this.agentInfo = await this.sendRpc<AcpInitializeResult>("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+    } catch (err: any) {
+      // Prefer the death reason (exit code + stderr) over a bare RPC rejection
+      const msg = err?.message || String(err);
+      throw new Error(
+        msg.includes("stderr:") ? msg : `${msg}${this.formatStderrTail()}`
+      );
+    }
+
     this.state = "IDLE";
+    this.readyAt = Date.now();
     this.lastUsedAt = Date.now();
   }
 
@@ -139,22 +203,40 @@ export class AcpWorker {
     return this.sniffer.getPort();
   }
 
+  public getStderrTail(): string {
+    return this.stderrTail;
+  }
+
   public getActiveSessionIds(): string[] {
-    return Array.from(this.activeSessions);
+    return Array.from(this.sessionLastUsedAt.keys());
   }
 
   public hasSession(sessionId: string): boolean {
-    return this.activeSessions.has(sessionId);
+    return this.sessionLastUsedAt.has(sessionId);
+  }
+
+  public isSessionInFlight(sessionId: string): boolean {
+    return this.activeStreamListeners.has(sessionId);
+  }
+
+  /** Marks a session as just used, so the idle sweep leaves it alone until its prompt starts. */
+  public touchSession(sessionId: string): void {
+    if (this.sessionLastUsedAt.has(sessionId)) {
+      this.sessionLastUsedAt.set(sessionId, Date.now());
+    }
   }
 
   /**
    * Creates a new ACP session on this worker in native `default` mode (no plan/build switching),
    * sets the target `acpModelId`, and injects `<system_override>` + external tool schemas.
+   * Evicts least-recently-used idle sessions first so the worker never exceeds `maxSessionsPerWorker`.
    */
   public async createSession(
     systemPromptAppend: string,
     acpModelId: string
   ): Promise<string> {
+    await this.evictIdleSessions(Math.max(0, config.maxSessionsPerWorker - 1));
+
     syncWorkerSandboxAuth(this.sandbox.absAppDataDir);
     const res = await this.sendRpc<AcpSessionNewResult>("session/new", {
       cwd: this.sandbox.jailCwd,
@@ -169,7 +251,7 @@ export class AcpWorker {
     });
 
     const sessionId = res.sessionId;
-    this.activeSessions.add(sessionId);
+    this.sessionLastUsedAt.set(sessionId, Date.now());
 
     if (res.models?.availableModels?.length) {
       this.availableModels = res.models.availableModels;
@@ -216,16 +298,21 @@ export class AcpWorker {
    */
   public async runPrompt(
     sessionId: string,
-    promptText: string,
+    prompt: AcpContentBlock[],
     acpModelId: string,
     callbacks: PromptStreamCallbacks,
     abortSignal?: AbortSignal
   ): Promise<ExtendedPromptExecutionResult> {
     await this.ensureSessionModel(sessionId, acpModelId);
+    if (abortSignal?.aborted) {
+      // A cancel sent ahead of the prompt would be ignored and the whole turn would still run
+      throw new PromptNotSentError("Prompt aborted before it was sent");
+    }
 
     this.sniffer.resetTurnModel();
     const startTime = Date.now();
     let firstTokenTime: number | null = null;
+    this.sessionLastUsedAt.set(sessionId, startTime);
 
     const wrappedCallbacks: PromptStreamCallbacks = {
       onThoughtChunk: (text) => {
@@ -250,20 +337,14 @@ export class AcpWorker {
       this.sendNotification("session/cancel", { sessionId });
     };
 
-    if (abortSignal) {
-      if (abortSignal.aborted) {
-        onAbort();
-      } else {
-        abortSignal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       const result = await this.sendRpc<AcpPromptResult>(
         "session/prompt",
         {
           sessionId,
-          prompt: [{ type: "text", text: promptText }],
+          prompt,
         },
         config.requestTimeoutMs
       );
@@ -285,12 +366,21 @@ export class AcpWorker {
         durationMs,
         actualModelVersion,
       };
+    } catch (err) {
+      // On timeout (or any other failure) stop the turn upstream so it does not keep burning quota
+      if (!abortSignal?.aborted) {
+        this.sendNotification("session/cancel", { sessionId });
+      }
+      throw err;
     } finally {
       if (abortSignal) {
         abortSignal.removeEventListener("abort", onAbort);
       }
       this.activeStreamListeners.delete(sessionId);
       this.lastUsedAt = Date.now();
+      if (this.sessionLastUsedAt.has(sessionId)) {
+        this.sessionLastUsedAt.set(sessionId, this.lastUsedAt);
+      }
     }
   }
 
@@ -313,14 +403,47 @@ export class AcpWorker {
   }
 
   public async closeSession(sessionId: string): Promise<void> {
-    if (!this.activeSessions.has(sessionId)) return;
-    this.activeSessions.delete(sessionId);
+    if (!this.sessionLastUsedAt.has(sessionId)) return;
+    this.sessionLastUsedAt.delete(sessionId);
     this.sessionAssignedModel.delete(sessionId);
     this.sessionConfirmedConfig.delete(sessionId);
     telemetryStore.markSessionClosed(sessionId);
+    this.hooks.onSessionClosed?.(sessionId);
     try {
       await this.sendRpc("session/close", { sessionId }, 5000);
-    } catch {}
+    } catch (err: any) {
+      // The session is forgotten locally either way; upstream may keep it alive until the worker exits
+      console.warn(
+        `[agy-acp2api] session/close failed for ${sessionId} on worker ${this.id}: ${
+          err?.message || String(err)
+        }`
+      );
+    }
+  }
+
+  /**
+   * Closes sessions that are not mid-turn and were last used before `cutoffMs`.
+   */
+  public async closeSessionsIdleSince(cutoffMs: number): Promise<number> {
+    const stale = Array.from(this.sessionLastUsedAt.entries())
+      .filter(([id, ts]) => ts < cutoffMs && !this.isSessionInFlight(id))
+      .map(([id]) => id);
+    await Promise.all(stale.map((id) => this.closeSession(id)));
+    return stale.length;
+  }
+
+  /**
+   * Closes least-recently-used idle sessions until at most `keep` sessions remain.
+   */
+  private async evictIdleSessions(keep: number): Promise<void> {
+    const excess = this.sessionLastUsedAt.size - keep;
+    if (excess <= 0) return;
+    const victims = Array.from(this.sessionLastUsedAt.entries())
+      .filter(([id]) => !this.isSessionInFlight(id))
+      .sort((a, b) => a[1] - b[1])
+      .slice(0, excess)
+      .map(([id]) => id);
+    await Promise.all(victims.map((id) => this.closeSession(id)));
   }
 
   public destroy(): void {
@@ -332,7 +455,7 @@ export class AcpWorker {
     }
     this.pendingRpcs.clear();
     this.activeStreamListeners.clear();
-    this.activeSessions.clear();
+    this.sessionLastUsedAt.clear();
     this.sessionAssignedModel.clear();
     this.sessionConfirmedConfig.clear();
 
@@ -346,6 +469,13 @@ export class AcpWorker {
     }
 
     cleanupWorkerSandbox(this.sandbox);
+  }
+
+  private formatStderrTail(): string {
+    const tail = this.stderrTail.trim();
+    if (!tail) return "";
+    const lines = tail.split(/\r?\n/).slice(-10).join("\n");
+    return `\nstderr:\n${lines}`;
   }
 
   private updateConfirmedConfigFromOptions(
@@ -527,11 +657,11 @@ export class AcpWorker {
     }
     this.pendingRpcs.clear();
     this.activeStreamListeners.clear();
-    this.activeSessions.clear();
+    this.sessionLastUsedAt.clear();
     this.sessionAssignedModel.clear();
     this.sessionConfirmedConfig.clear();
     this.sniffer.stop();
     cleanupWorkerSandbox(this.sandbox);
-    this.onDeathCallback?.(this.id);
+    this.hooks.onDeath?.(this, err);
   }
 }

@@ -1,6 +1,6 @@
 import { exec } from "node:child_process";
 import { serve } from "@hono/node-server";
-import { config } from "./config.js";
+import { config, DEFAULT_API_KEY, isLoopbackHost } from "./config.js";
 import { WorkerPool } from "./pool/worker-pool.js";
 import { createGatewayApp } from "./server/app.js";
 import { telemetryStore } from "./telemetry/metrics-store.js";
@@ -56,11 +56,25 @@ function openUrlInBrowser(url: string) {
 async function main() {
   const { openBrowser } = parseCliArgs();
 
+  if (!isLoopbackHost(config.host) && config.apiKey === DEFAULT_API_KEY) {
+    console.error(
+      `[agy-acp2api] Refusing to listen on ${config.host} with the default API key. ` +
+        "Set AGY2API_KEY (or apiKey in settings.json) to a private value first."
+    );
+    process.exit(1);
+  }
+
   console.log(
     `[agy-acp2api] Initializing ACP Warm Worker Pool (min=${config.minWorkers}, max=${config.maxWorkers})...`
   );
   const pool = new WorkerPool();
-  await pool.initialize();
+  const init = await pool.initialize();
+  if (init.failed > 0) {
+    console.warn(
+      `[agy-acp2api] ${init.failed} worker(s) failed to start; retrying in the background with backoff. ` +
+        "Check that `agy` is installed and logged in."
+    );
+  }
   console.log(`[agy-acp2api] Warm Worker Pool ready:`, pool.getStats());
 
   const app = createGatewayApp(pool);

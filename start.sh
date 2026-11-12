@@ -10,26 +10,61 @@ PID_FILE=".agy2api.pid"
 LOG_FILE="agy2api.log"
 ACTION="${1:-start}"
 
+# SIGTERM lets the gateway close its agy workers and sandboxes; SIGKILL only if it hangs
+terminate() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+HERE="$(pwd -P)"
+
+# Working directory of a process; empty if it cannot be read
+proc_cwd() {
+  if [ -e "/proc/$1/cwd" ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+  fi
+}
+
+# node running this checkout's gateway entry point from this directory
+is_local_gateway() {
+  local cmd
+  cmd=$(ps -o command= -p "$1" 2>/dev/null || true)
+  case "${cmd%% *}" in
+    node | */node | node[0-9]* | */node[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$cmd" in
+    *src/index.ts* | *dist/index.js*) ;;
+    *) return 1 ;;
+  esac
+  [ "$(proc_cwd "$1")" = "$HERE" ]
+}
+
+# Only ever stops the gateway of this checkout (whether started by this script, `fg`,
+# `npm start` or an older version of the script); other Node apps and other gateways
+# (and their agy workers) on the same machine are left alone
 stop_service() {
-  local stopped=0
+  local stopped=0 pid pids=""
   if [ -f "$PID_FILE" ]; then
-    local old_pid
-    old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "[INFO] 正在停止旧的常驻进程 (PID: $old_pid)..."
-      kill "$old_pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$old_pid" 2>/dev/null || true
-      stopped=1
-    fi
+    pids=$(cat "$PID_FILE" 2>/dev/null || true)
     rm -f "$PID_FILE"
   fi
+  pids="$pids $(pgrep -f 'src/index\.ts|dist/index\.js' 2>/dev/null || true)"
 
-  if pkill -f "src/index.ts" 2>/dev/null || pkill -f "dist/index.js" 2>/dev/null; then
-    stopped=1
-    sleep 1
-  fi
-  pkill -f "agy acp --sandbox" 2>/dev/null || true
+  for pid in $(printf '%s\n' $pids | sort -u); do
+    if kill -0 "$pid" 2>/dev/null && is_local_gateway "$pid"; then
+      echo "[INFO] 正在停止本目录的网关进程 (PID: $pid)..."
+      terminate "$pid"
+      stopped=1
+    fi
+  done
 
   return $stopped
 }
@@ -80,7 +115,9 @@ case "$ACTION" in
     check_env
     stop_service || true
     shift || true
-    exec npx tsx --no-warnings src/index.ts --no-open "$@"
+    # exec keeps this PID, so `status` / `stop` from another terminal find it
+    echo "$$" > "$PID_FILE"
+    exec node --no-warnings --import tsx src/index.ts --no-open "$@"
     ;;
 
   start|restart|*)
@@ -91,7 +128,8 @@ case "$ACTION" in
     stop_service || true
 
     echo "[INFO] 正在以常驻守护模式后台启动 agy-acp2api..."
-    nohup npx tsx --no-warnings src/index.ts --no-open > "$LOG_FILE" 2>&1 < /dev/null &
+    # node itself (not npx) so the recorded PID is the gateway and SIGTERM reaches it
+    nohup node --no-warnings --import tsx src/index.ts --no-open > "$LOG_FILE" 2>&1 < /dev/null &
     NEW_PID=$!
     disown "$NEW_PID" 2>/dev/null || true
     echo "$NEW_PID" > "$PID_FILE"

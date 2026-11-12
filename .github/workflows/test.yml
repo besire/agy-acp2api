@@ -1,0 +1,56 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway:
+    name: Typecheck & tests (Node)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit & black-box tests (fake agy)
+        run: npm test
+
+  cpa-plugin:
+    name: Vet & build (CPA plugin)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: cpa-plugin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: cpa-plugin/go.mod
+          cache-dependency-path: cpa-plugin/go.sum
+
+      - name: Vet
+        run: go vet ./internal/... ./cmd/...
+
+      - name: Build shared library
+        run: CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/agy-acp2api.so ./cmd/agy-acp2api
