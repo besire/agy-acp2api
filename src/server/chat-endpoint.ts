@@ -1,8 +1,13 @@
 import { Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { ChatService, ChatTurn, errorMessage } from "../core/chat-service.js";
-import { ChatRequest, GatewayError } from "../core/chat.js";
-import { ChatProtocol, ResponseContext, SseFrame } from "../protocols/protocol.js";
+import { GatewayError, TurnResult } from "../core/chat.js";
+import {
+  ChatProtocol,
+  DecodedRequest,
+  ResponseContext,
+  SseFrame,
+} from "../protocols/protocol.js";
 
 function toGatewayError(err: unknown): GatewayError {
   return err instanceof GatewayError
@@ -14,7 +19,7 @@ function toGatewayError(err: unknown): GatewayError {
  * HTTP handler for one chat protocol: decode → prepare → (stream | respond). All protocol
  * specifics live in `protocol`; everything else is shared.
  */
-export function chatEndpoint(protocol: ChatProtocol, service: ChatService) {
+export function chatEndpoint<S>(protocol: ChatProtocol<S>, service: ChatService) {
   const fail = (c: Context, err: GatewayError) =>
     c.json(protocol.encodeError(err) as object, err.status);
 
@@ -26,16 +31,17 @@ export function chatEndpoint(protocol: ChatProtocol, service: ChatService) {
       return fail(c, new GatewayError("Invalid JSON request body", 400, "invalid_request_error"));
     }
 
-    let req: ChatRequest;
+    let decoded: DecodedRequest<S>;
     let turn: ChatTurn;
     const id = protocol.newResponseId();
     const created = Math.floor(Date.now() / 1000);
     try {
-      req = protocol.decodeRequest(body);
-      turn = await service.prepare(req, id);
+      decoded = protocol.decodeRequest(body);
+      turn = await service.prepare(decoded.chat, id);
     } catch (err) {
       return fail(c, toGatewayError(err));
     }
+    const { chat: req, state } = decoded;
 
     c.header("X-Agy2Api-Session-Cache", turn.sessionCache);
     c.header("X-Agy2Api-Session-Id", turn.sessionId);
@@ -43,7 +49,11 @@ export function chatEndpoint(protocol: ChatProtocol, service: ChatService) {
     c.header("X-Agy2Api-Resolved-Model", turn.target.baseModelId);
     c.header("X-Agy2Api-Thinking-Level", turn.target.thinkingLevel);
 
-    const ctx: ResponseContext = { id, created, model: turn.target.baseModelId };
+    const ctx: ResponseContext<S> = { id, created, model: turn.target.baseModelId, state };
+    const completed = (result: TurnResult) => {
+      protocol.onTurnComplete?.(ctx, req, result);
+      return result;
+    };
 
     if (req.stream) {
       return streamSSE(c, async (stream) => {
@@ -61,7 +71,9 @@ export function chatEndpoint(protocol: ChatProtocol, service: ChatService) {
 
         send(encoder.start());
         try {
-          const result = await turn.run((event) => send(encoder.event(event)), abortController.signal);
+          const result = completed(
+            await turn.run((event) => send(encoder.event(event)), abortController.signal)
+          );
           await sendAndWait(encoder.finish(result));
         } catch (err) {
           await sendAndWait(encoder.fail(errorMessage(err)));
@@ -70,7 +82,7 @@ export function chatEndpoint(protocol: ChatProtocol, service: ChatService) {
     }
 
     try {
-      const result = await turn.run(() => {}, c.req.raw.signal);
+      const result = completed(await turn.run(() => {}, c.req.raw.signal));
       c.header("X-Agy2Api-Actual-Model", result.actualModel);
       c.header("X-Agy2Api-TTFT-Ms", String(result.ttftMs));
       return c.json(protocol.encodeResponse(ctx, result) as object);

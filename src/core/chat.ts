@@ -110,7 +110,11 @@ export class GatewayError extends Error {
   constructor(
     message: string,
     readonly status: 400 | 500 | 503,
-    readonly type: GatewayErrorType
+    readonly type: GatewayErrorType,
+    /** Machine-readable detail, e.g. `previous_response_not_found`. */
+    readonly code?: string,
+    /** The request field at fault. */
+    readonly param?: string
   ) {
     super(message);
   }

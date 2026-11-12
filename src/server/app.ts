@@ -12,6 +12,7 @@ import { buildUnifiedModelCatalog } from "../compiler/model-resolver.js";
 import { ChatService } from "../core/chat-service.js";
 import { WorkerPool } from "../pool/worker-pool.js";
 import { openAIChatCompletions } from "../protocols/openai/chat-completions.js";
+import { createResponsesProtocol } from "../protocols/openai/responses.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
 import { renderDashboardHtml } from "./dashboard-ui.js";
 import { BRAND_ICON_SVG } from "./brand-icon.js";
@@ -248,10 +249,11 @@ export function createGatewayApp(pool: WorkerPool): Hono {
   });
 
   // ============================================================================
-  // 5. POST /v1/chat/completions
+  // 5. Chat endpoints: one shared pipeline, one codec per API format
   // ============================================================================
   const chatService = new ChatService(pool);
   app.post("/v1/chat/completions", chatEndpoint(openAIChatCompletions, chatService));
+  app.post("/v1/responses", chatEndpoint(createResponsesProtocol(), chatService));
 
   return app;
 }

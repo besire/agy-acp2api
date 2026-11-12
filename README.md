@@ -135,6 +135,21 @@ npm run start:prod
 | **OpenAI v1 Base URL** | `http://127.0.0.1:8787/v1` | 填入各 AI 客户端 |
 | **默认 API Key** | `sk-agy2api-local-key` | 可在 Web 控制台「核心配置热更新」或环境变量中修改 |
 
+### 支持的接口格式
+
+| 接口 | 说明 |
+| :--- | :--- |
+| `POST /v1/chat/completions` | OpenAI Chat Completions，流式 / 非流式、工具调用、`reasoning_content` 思考流 |
+| `POST /v1/responses` | OpenAI Responses API（Codex 等客户端），见下文 |
+| `GET /v1/models` | 模型列表（合并思考强度变体） |
+
+`/v1/responses` 的支持范围：
+
+* 输入：字符串或输入项数组，支持 `message`（`input_text` / `output_text` / `input_image`）、`function_call`、`function_call_output`；`reasoning` 及联网搜索等托管工具项会被忽略，`item_reference` 返回 400。
+* 输出：思考内容作为 `reasoning` 项（summary）、正文作为 `message` 项、每个工具调用一个 `function_call` 项；流式按官方 `response.*` 事件序列输出，中途失败以 `response.failed` 结束。
+* 续接：每轮重发完整历史的客户端（如 `store: false`）与使用 `previous_response_id` 的客户端都能命中会话缓存，只把新增内容发给 `agy`。`previous_response_id` 依赖网关内存中的记录（1 小时、最多 500 条，重启即失效），`store: false` 的响应不会被记录。
+* 工具只支持 `type: "function"`；`custom`（自由格式）等其他类型会被忽略。暂不支持 `GET /v1/responses/{id}`。图片目前仍只保留文字部分，原生图片输入在后续版本中支持。
+
 ### 鉴权与安全
 
 * `/v1/*` 与管理接口 `/api/admin/*` 都需要 API Key，可放在 `Authorization: Bearer <key>` 或 `X-Agy2Api-Key: <key>` 请求头中。控制台首次打开时会弹窗要求输入，Key 只保存在当前浏览器的 `localStorage` 中，服务端不会在任何接口中回传它。

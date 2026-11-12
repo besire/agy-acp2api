@@ -1,12 +1,19 @@
 import { ChatRequest, GatewayError, TurnEvent, TurnResult } from "../core/chat.js";
 
 /** Identity of one response, fixed before the turn starts. */
-export interface ResponseContext {
+export interface ResponseContext<S = undefined> {
   id: string;
   /** Unix seconds. */
   created: number;
   /** Model reported until the upstream model is detected. */
   model: string;
+  /** Protocol-specific data decoded with the request (e.g. fields echoed in the response). */
+  state: S;
+}
+
+export interface DecodedRequest<S> {
+  chat: ChatRequest;
+  state: S;
 }
 
 export interface SseFrame {
@@ -25,11 +32,13 @@ export interface ChatStreamEncoder {
 }
 
 /** One client-facing chat API, e.g. OpenAI Chat Completions. */
-export interface ChatProtocol {
+export interface ChatProtocol<S = undefined> {
   /** Validates a parsed JSON body; throws a 400 `GatewayError` when it is unusable. */
-  decodeRequest(body: unknown): ChatRequest;
+  decodeRequest(body: unknown): DecodedRequest<S>;
   newResponseId(): string;
-  encodeResponse(ctx: ResponseContext, result: TurnResult): unknown;
-  createStreamEncoder(ctx: ResponseContext): ChatStreamEncoder;
+  encodeResponse(ctx: ResponseContext<S>, result: TurnResult): unknown;
+  createStreamEncoder(ctx: ResponseContext<S>): ChatStreamEncoder;
   encodeError(err: GatewayError): unknown;
+  /** Runs after a successful turn, before the final response is sent. */
+  onTurnComplete?(ctx: ResponseContext<S>, request: ChatRequest, result: TurnResult): void;
 }

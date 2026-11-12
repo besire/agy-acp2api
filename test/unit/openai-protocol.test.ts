@@ -121,7 +121,7 @@ describe("OpenAI chat completions codec", () => {
   });
 
   test("stream encoder emits role, deltas, the detected model, usage and [DONE]", () => {
-    const enc = openAIChatCompletions.createStreamEncoder({ id: "chatcmpl-x", created: 1, model: "base" });
+    const enc = openAIChatCompletions.createStreamEncoder({ id: "chatcmpl-x", created: 1, model: "base", state: undefined });
     const frames = [
       ...enc.start(),
       ...enc.event({ type: "thought", text: "hmm" }),
@@ -159,7 +159,7 @@ describe("OpenAI chat completions codec", () => {
   });
 
   test("stream encoder reports a mid-stream failure as a final stop chunk", () => {
-    const enc = openAIChatCompletions.createStreamEncoder({ id: "chatcmpl-x", created: 1, model: "base" });
+    const enc = openAIChatCompletions.createStreamEncoder({ id: "chatcmpl-x", created: 1, model: "base", state: undefined });
     const [chunk, done] = enc.fail("boom");
     assert.equal(done.data, "[DONE]");
     const parsed = JSON.parse(chunk.data);
@@ -169,7 +169,7 @@ describe("OpenAI chat completions codec", () => {
 
   test("non-streaming response uses null content beside tool calls and the actual model", () => {
     const body = openAIChatCompletions.encodeResponse(
-      { id: "chatcmpl-x", created: 1, model: "base" },
+      { id: "chatcmpl-x", created: 1, model: "base", state: undefined },
       result
     ) as any;
     assert.equal(body.object, "chat.completion");
@@ -182,7 +182,7 @@ describe("OpenAI chat completions codec", () => {
     });
 
     const plain = openAIChatCompletions.encodeResponse(
-      { id: "chatcmpl-y", created: 1, model: "base" },
+      { id: "chatcmpl-y", created: 1, model: "base", state: undefined },
       {
         ...result,
         message: { role: "assistant", content: [], toolCalls: [] },

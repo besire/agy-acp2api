@@ -80,7 +80,8 @@ export function reasoningEffortFromBody(
   return null;
 }
 
-function decodeImageUrl(url: string): ImagePart {
+/** `data:` URLs become inline base64 images; anything else stays a URL reference. */
+export function decodeImageUrl(url: string): ImagePart {
   const dataUrl = url.match(/^data:([^;,]*)[^,]*;base64,/i);
   if (dataUrl) {
     return {
@@ -114,7 +115,7 @@ function decodeContent(content: unknown): ContentPart[] {
   return parts;
 }
 
-function encodeArguments(args: unknown): string {
+export function encodeArguments(args: unknown): string {
   return typeof args === "string" ? args : JSON.stringify(args ?? {});
 }
 
@@ -324,7 +325,9 @@ class OpenAIChatStreamEncoder implements ChatStreamEncoder {
 }
 
 export const openAIChatCompletions: ChatProtocol = {
-  decodeRequest: decodeChatCompletionRequest,
+  decodeRequest(body) {
+    return { chat: decodeChatCompletionRequest(body), state: undefined };
+  },
 
   newResponseId() {
     return `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
@@ -355,6 +358,6 @@ export const openAIChatCompletions: ChatProtocol = {
   },
 
   encodeError(err) {
-    return { error: { message: err.message, type: err.type } };
+    return { error: { message: err.message, type: err.type, ...(err.code ? { code: err.code } : {}) } };
   },
 };
