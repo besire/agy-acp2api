@@ -10,6 +10,19 @@ PID_FILE=".agy2api.pid"
 LOG_FILE="agy2api.log"
 ACTION="${1:-start}"
 
+# SIGTERM lets the gateway close its agy workers and sandboxes; SIGKILL only if it hangs
+terminate() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || return 0
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+# Only ever stops the gateway of this checkout: other Node apps and other gateways
+# (and their agy workers) on the same machine are left alone
 stop_service() {
   local stopped=0
   if [ -f "$PID_FILE" ]; then
@@ -17,19 +30,19 @@ stop_service() {
     old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
       echo "[INFO] 正在停止旧的常驻进程 (PID: $old_pid)..."
-      kill "$old_pid" 2>/dev/null || true
-      sleep 1
-      kill -9 "$old_pid" 2>/dev/null || true
+      terminate "$old_pid"
       stopped=1
     fi
     rm -f "$PID_FILE"
   fi
 
-  if pkill -f "src/index.ts" 2>/dev/null || pkill -f "dist/index.js" 2>/dev/null; then
+  # Instances started by older versions of this script (via npx) are only known by their command line
+  local pid
+  for pid in $(pgrep -f "$PWD/node_modules/tsx/dist/loader.mjs .*src/index.ts" 2>/dev/null || true); do
+    echo "[INFO] 正在停止本目录的旧进程 (PID: $pid)..."
+    terminate "$pid"
     stopped=1
-    sleep 1
-  fi
-  pkill -f "agy acp --sandbox" 2>/dev/null || true
+  done
 
   return $stopped
 }
@@ -80,7 +93,7 @@ case "$ACTION" in
     check_env
     stop_service || true
     shift || true
-    exec npx tsx --no-warnings src/index.ts --no-open "$@"
+    exec node --no-warnings --import tsx src/index.ts --no-open "$@"
     ;;
 
   start|restart|*)
@@ -91,7 +104,8 @@ case "$ACTION" in
     stop_service || true
 
     echo "[INFO] 正在以常驻守护模式后台启动 agy-acp2api..."
-    nohup npx tsx --no-warnings src/index.ts --no-open > "$LOG_FILE" 2>&1 < /dev/null &
+    # node itself (not npx) so the recorded PID is the gateway and SIGTERM reaches it
+    nohup node --no-warnings --import tsx src/index.ts --no-open > "$LOG_FILE" 2>&1 < /dev/null &
     NEW_PID=$!
     disown "$NEW_PID" 2>/dev/null || true
     echo "$NEW_PID" > "$PID_FILE"

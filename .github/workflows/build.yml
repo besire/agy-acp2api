@@ -104,7 +104,9 @@ jobs:
 
   release:
     name: Release
-    if: github.event_name != 'pull_request' && !contains(github.event.head_commit.message, '[skip ci]')
+    # Only a version tag publishes: pushes to main used to re-upload unversioned builds over the
+    # existing release's assets and commit them to main
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build
     runs-on: ubuntu-24.04
