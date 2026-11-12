@@ -35,7 +35,7 @@ linux.do里的一个项目——[dsh-plugin-bundle](https://github.com/lili-luo/
    * 每个常驻 Worker 进程通过独立 `--gemini-dir`（`~/.gemini/agy2api-worker-{id}`）与自定义极简 Agent（`excludeDefaultComponents: true`）启动，彻底剥离 `agy` 默认人设与内置文件/终端/浏览器工具 Schema（单轮基础上下文从 `~7,000` tokens 精简至 `~400` tokens），同时隔离宿主全局 `~/.gemini/config` 干扰，并将工作目录锁定在只读空沙箱（Jail Directory）。
    * 底层通过 `PreToolUse` 生命周期钩子与 `session/request_permission` 双重硬阻断，**杜绝触发任何 `agy` CLI 内置工具（含残留控制面工具 `manage_task`）**，强制模型仅使用外部客户端传入的 `tools`（包括外部 MCP、Web Search、Playwright 等）。
 2. **会话缓存复用**
-   * 自动对 OpenAI `messages` 历史前缀计算哈希链。在多轮对话或工具结果（`role: "tool"`）回传时自动命中已有 `sessionId`（`HASH HIT`），仅编译并发送新增的增量消息（Delta Prompt），使其可以一定程度不受agy cli+acp协议的影响，照常实现一定程度的缓存命中。
+   * 自动对 OpenAI `messages` 历史前缀计算哈希链。在多轮对话或工具结果（`role: "tool"`）回传时自动命中已有 `sessionId`（`HASH HIT`），仅编译并发送新增的增量消息（Delta Prompt），使其可以一定程度不受agy cli+acp协议的影响，照常实现一定程度的缓存命中。规则见[会话复用规则](#会话复用规则)。
 3. **滑动窗口流式解析器**
    * 内置 [`ToolCallStreamParser`](./src/parser/stream-parser.ts) 滑动窗口状态机，实时拦截模型流式输出中的工具调用块并转化为标准 OpenAI `delta.tool_calls` SSE 事件，同时内置 `jsonrepair` 自动修复模型偶发的非标 JSON 参数。
 4. **常驻热进程池与并发防风控**
@@ -160,6 +160,20 @@ npm run start:prod
 * 图片无法使用（下载失败、格式无法识别、base64 损坏、超过大小）时返回 `400`（`code: invalid_image`），不会影响 Worker。
 * 命中会话缓存时只发送新增消息里的图片，历史图片不会重复下载和上传。助手消息与系统消息里的图片不会发给模型。
 
+### 会话复用规则
+
+* 一个 ACP 会话只能从它**最新**的一轮继续：重新生成（regenerate）、编辑历史、失败后重试等请求会开一个新会话并重放完整历史，而不会把同一个问题再追加进已经回答过它的会话（否则模型会看到重复的对话）。
+* 请求失败、客户端中途断开、命中 `stop` 被截断的轮次，其会话中的上游历史已与客户端看到的不一致，会被立即关闭；同一对话的下一次请求会重放完整历史。
+* 持有该会话的 Worker 正在处理别的对话时，请求会先等它空闲（默认最多 30 秒，`AGY2API_AFFINITY_WAIT_MS`），而不是立刻在另一个 Worker 上重放整段历史；等待超时才回退到新会话。
+* 控制台「请求」页对每个未复用的请求标注原因：新对话 / 历史不匹配 / 原进程忙且等待超时，首页「会话复用率」悬浮提示中有汇总。
+
+### 结束原因与 `stop`
+
+* 上游因输出长度上限结束时 `finish_reason` 为 `length`，模型拒答为 `content_filter`；Responses API 对应 `status: "incomplete"` 与 `incomplete_details.reason`（`max_output_tokens` / `content_filter`），流式以 `response.incomplete` 结束。
+* Chat Completions 的 `stop`（字符串或最多 4 个字符串）由网关实现：可见文本在第一个停止序列前截断（跨分片也能识别），随后立即取消上游这一轮以节省额度。
+* `max_tokens`、`temperature`、`top_p` 无法传给 `agy`，会被忽略。
+* 模型把工具名写成 `functions.x`、`default_api:x` 或大小写不同时，会映射回请求中声明的工具名；无法解析的 `<tool_call>` 块会计入控制台统计。
+
 ### 鉴权与安全
 
 * `/v1/*` 与管理接口 `/api/admin/*` 都需要 API Key，可放在 `Authorization: Bearer <key>` 或 `X-Agy2Api-Key: <key>` 请求头中。控制台首次打开时会弹窗要求输入，Key 只保存在当前浏览器的 `localStorage` 中，服务端不会在任何接口中回传它。
@@ -199,6 +213,10 @@ npm run start:prod
 | `AGY_SESSION_TTL_MS` | `600000` | 会话空闲超过该时长后真正关闭（`session/close`）并失去缓存复用 |
 | `AGY_WORKER_IDLE_TTL_MS` | `180000` | 超出 `minWorkers` 的扩容 Worker 空闲多久后回收 |
 | `AGY_REQUEST_TIMEOUT_MS` | `300000` | 单次请求超时；超时后会向上游发送 `session/cancel` |
+| `AGY2API_AFFINITY_WAIT_MS` | `30000` | 会话所在 Worker 忙时最多等待多久再改为新会话重放历史；`0` 表示不等待 |
+| `AGY2API_MODEL_SNIFFER` | 关闭 | 设为 `1` 时让 `agy` 的上游流量经过本地代理，以读取实际响应的模型版本（见下文） |
+
+**关于上游流量**：默认情况下 `agy` 直接连接它自己的后端，网络层面与单独运行 `agy` 一致。开启 `AGY2API_MODEL_SNIFFER` 后，`agy` 的请求会先发到本地 Node 代理再转发给 Google，可以在控制台看到每轮实际响应的模型版本（如 trial 路由），但上游看到的连接特征（TLS 实现、HTTP/1.1）不再是 `agy` 原生的；关闭时显示的是会话确认的模型。
 
 <details>
 <summary>进阶调优（一般无需修改）</summary>

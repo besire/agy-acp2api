@@ -234,4 +234,22 @@ describe("ResponseStore", () => {
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(store.get("a"), undefined);
   });
+
+  test("stays within its size budget but always keeps the newest entry", () => {
+    const store = new ResponseStore(60_000, 100, 10);
+    store.save("a", [user("1234")]);
+    store.save("b", [user("5678")]);
+    assert.equal(store.size(), 2);
+    store.save("c", [user("abcd")]);
+    assert.equal(store.size(), 2);
+    assert.equal(store.get("a"), undefined);
+
+    store.save("huge", [user("x".repeat(50))]);
+    assert.equal(store.size(), 1);
+    assert.ok(store.get("huge"));
+    // Re-saving an id replaces its size instead of adding to it
+    store.save("huge", [user("y")]);
+    store.save("d", [user("12345678")]);
+    assert.equal(store.size(), 2);
+  });
 });
