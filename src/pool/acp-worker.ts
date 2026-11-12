@@ -57,6 +57,9 @@ export function modelSnifferEnabled(): boolean {
   return /^(1|true|yes|on)$/i.test(process.env.AGY2API_MODEL_SNIFFER?.trim() ?? "");
 }
 
+/** The turn was abandoned before `session/prompt` went out; the session is unchanged. */
+export class PromptNotSentError extends Error {}
+
 const STDERR_TAIL_LIMIT = 4096;
 // After `exit`, wait this long for stdio to drain so the stderr tail is complete
 const EXIT_DRAIN_GRACE_MS = 250;
@@ -303,7 +306,7 @@ export class AcpWorker {
     await this.ensureSessionModel(sessionId, acpModelId);
     if (abortSignal?.aborted) {
       // A cancel sent ahead of the prompt would be ignored and the whole turn would still run
-      throw new Error("Prompt aborted before it was sent");
+      throw new PromptNotSentError("Prompt aborted before it was sent");
     }
 
     this.sniffer.resetTurnModel();

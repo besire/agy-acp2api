@@ -21,27 +21,49 @@ terminate() {
   kill -9 "$pid" 2>/dev/null || true
 }
 
-# Only ever stops the gateway of this checkout: other Node apps and other gateways
+HERE="$(pwd -P)"
+
+# Working directory of a process; empty if it cannot be read
+proc_cwd() {
+  if [ -e "/proc/$1/cwd" ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1
+  fi
+}
+
+# node running this checkout's gateway entry point from this directory
+is_local_gateway() {
+  local cmd
+  cmd=$(ps -o command= -p "$1" 2>/dev/null || true)
+  case "${cmd%% *}" in
+    node | */node | node[0-9]* | */node[0-9]*) ;;
+    *) return 1 ;;
+  esac
+  case "$cmd" in
+    *src/index.ts* | *dist/index.js*) ;;
+    *) return 1 ;;
+  esac
+  [ "$(proc_cwd "$1")" = "$HERE" ]
+}
+
+# Only ever stops the gateway of this checkout (whether started by this script, `fg`,
+# `npm start` or an older version of the script); other Node apps and other gateways
 # (and their agy workers) on the same machine are left alone
 stop_service() {
-  local stopped=0
+  local stopped=0 pid pids=""
   if [ -f "$PID_FILE" ]; then
-    local old_pid
-    old_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-      echo "[INFO] 正在停止旧的常驻进程 (PID: $old_pid)..."
-      terminate "$old_pid"
-      stopped=1
-    fi
+    pids=$(cat "$PID_FILE" 2>/dev/null || true)
     rm -f "$PID_FILE"
   fi
+  pids="$pids $(pgrep -f 'src/index\.ts|dist/index\.js' 2>/dev/null || true)"
 
-  # Instances started by older versions of this script (via npx) are only known by their command line
-  local pid
-  for pid in $(pgrep -f "$PWD/node_modules/tsx/dist/loader.mjs .*src/index.ts" 2>/dev/null || true); do
-    echo "[INFO] 正在停止本目录的旧进程 (PID: $pid)..."
-    terminate "$pid"
-    stopped=1
+  for pid in $(printf '%s\n' $pids | sort -u); do
+    if kill -0 "$pid" 2>/dev/null && is_local_gateway "$pid"; then
+      echo "[INFO] 正在停止本目录的网关进程 (PID: $pid)..."
+      terminate "$pid"
+      stopped=1
+    fi
   done
 
   return $stopped
@@ -93,6 +115,8 @@ case "$ACTION" in
     check_env
     stop_service || true
     shift || true
+    # exec keeps this PID, so `status` / `stop` from another terminal find it
+    echo "$$" > "$PID_FILE"
     exec node --no-warnings --import tsx src/index.ts --no-open "$@"
     ;;
 

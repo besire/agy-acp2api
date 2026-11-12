@@ -51,17 +51,21 @@ export interface WorkerPoolOptions {
  */
 export class PoolUnavailableError extends Error {}
 
+/** The client went away while its request was still waiting for a worker. */
+export class RequestAbortedError extends Error {}
+
+/**
+ * A request waiting for any worker. `settle` removes it from the queue, clears its timer and
+ * abort listener, then resolves with the worker or rejects with the error; only the first call counts.
+ */
 interface QueuedWaiter {
-  resolve: (worker: AcpWorker) => void;
-  reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
+  settle: (outcome: AcpWorker | Error) => void;
   since: number;
 }
 
-/** Waits for one particular worker; resolves true once that worker is handed over BUSY. */
+/** Waits for one particular worker; settles true once that worker is handed over BUSY. */
 interface AffinityWaiter {
-  resolve: (granted: boolean) => void;
-  timer: NodeJS.Timeout;
+  settle: (granted: boolean) => void;
   since: number;
 }
 
@@ -159,7 +163,8 @@ export class WorkerPool {
   public async acquireForRequest(
     baseModelId: string,
     tools: ToolDefinition[],
-    messages: ChatMessage[]
+    messages: ChatMessage[],
+    signal?: AbortSignal
   ): Promise<LeaseAcquisition> {
     const findMatch = () =>
       this.sessionRegistry.findBestMatchingPrefix(
@@ -200,22 +205,34 @@ export class WorkerPool {
       }
 
       // Its worker is serving another session: waiting for it is usually far cheaper than
-      // replaying the whole history into a new session
+      // replaying the whole history into a new session. Keep the session from idling out meanwhile.
       missReason = "worker_busy";
-      if (await this.waitForWorker(worker, this.opts.affinityWaitMs)) {
+      worker.touchSession(match.entry.sessionId);
+      if (await this.waitForWorker(worker, this.opts.affinityWaitMs, signal)) {
         const again = findMatch();
         if (again && again.entry.workerId === worker.id) {
           return reuse(worker, again);
         }
         return { ...this.freshLease(worker, messages), missReason: "no_match" };
       }
+      // The worker went away with its sessions, rather than staying busy
+      if (!this.workers.has(worker.id)) missReason = "no_match";
     }
 
-    return { ...(await this.acquireFresh(messages)), missReason };
+    return { ...(await this.acquireFresh(messages, signal)), missReason };
   }
 
   /** Leases any worker for a new session, starting or waiting for one if needed. */
-  public async acquireFresh(messages: ChatMessage[]): Promise<LeaseAcquisition> {
+  public async acquireFresh(
+    messages: ChatMessage[],
+    signal?: AbortSignal
+  ): Promise<LeaseAcquisition> {
+    if (this.shuttingDown) {
+      throw new PoolUnavailableError("The gateway is shutting down");
+    }
+    if (signal?.aborted) {
+      throw new RequestAbortedError("The client went away while waiting for a worker");
+    }
     const freshLease = (worker: AcpWorker) => this.freshLease(worker, messages);
 
     // 2. Cache Miss: find any IDLE worker
@@ -244,7 +261,7 @@ export class WorkerPool {
     }
 
     // 4. At capacity (or backing off with workers still starting/busy): wait for the next free worker
-    return freshLease(await this.enqueueWaiter(this.opts.queueTimeoutMs));
+    return freshLease(await this.enqueueWaiter(this.opts.queueTimeoutMs, signal));
   }
 
   /** Gives back a lease whose prompt was never sent, so a claimed session stays reusable. */
@@ -268,19 +285,15 @@ export class WorkerPool {
     const affinityQueue = this.affinityWaiters.get(worker.id);
     const affinity = affinityQueue?.[0];
     if (affinity && !(this.waitQueue[0]?.since < affinity.since)) {
-      affinityQueue!.shift();
-      if (affinityQueue!.length === 0) this.affinityWaiters.delete(worker.id);
-      clearTimeout(affinity.timer);
       this.reserve(worker);
-      affinity.resolve(true);
+      affinity.settle(true);
       return;
     }
 
-    const waiter = this.waitQueue.shift();
+    const waiter = this.waitQueue[0];
     if (waiter) {
-      clearTimeout(waiter.timer);
       this.reserve(worker);
-      waiter.resolve(worker);
+      waiter.settle(worker);
       return;
     }
 
@@ -428,6 +441,9 @@ export class WorkerPool {
    * queued request (if any) or parked IDLE.
    */
   private async spawnNewWorker(reserve = false): Promise<AcpWorker> {
+    if (this.shuttingDown) {
+      throw new PoolUnavailableError("The gateway is shutting down");
+    }
     const id = crypto.randomUUID().slice(0, 8);
     let worker: AcpWorker;
     try {
@@ -555,62 +571,78 @@ export class WorkerPool {
   }
 
   /**
-   * Waits until `worker` is released and hands it over BUSY. False on timeout or when the
-   * worker leaves the pool first.
+   * Waits until `worker` is released and hands it over BUSY. False on timeout, when the client
+   * goes away, or when the worker leaves the pool first.
    */
-  private waitForWorker(worker: AcpWorker, timeoutMs: number): Promise<boolean> {
-    if (timeoutMs <= 0) return Promise.resolve(false);
+  private waitForWorker(
+    worker: AcpWorker,
+    timeoutMs: number,
+    signal?: AbortSignal
+  ): Promise<boolean> {
+    if (timeoutMs <= 0 || signal?.aborted) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
+      let done = false;
+      const settle = (granted: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        const waiters = this.affinityWaiters.get(worker.id);
+        const idx = waiters ? waiters.indexOf(waiter) : -1;
+        if (idx !== -1) waiters!.splice(idx, 1);
+        if (waiters?.length === 0) this.affinityWaiters.delete(worker.id);
+        resolve(granted);
+      };
+      const onAbort = () => settle(false);
+      const timer = setTimeout(() => settle(false), timeoutMs);
+      const waiter: AffinityWaiter = { settle, since: Date.now() };
+      signal?.addEventListener("abort", onAbort, { once: true });
+
       const waiters = this.affinityWaiters.get(worker.id) ?? [];
       this.affinityWaiters.set(worker.id, waiters);
-      const waiter: AffinityWaiter = {
-        resolve,
-        since: Date.now(),
-        timer: setTimeout(() => {
-          const idx = waiters.indexOf(waiter);
-          if (idx !== -1) waiters.splice(idx, 1);
-          if (waiters.length === 0 && this.affinityWaiters.get(worker.id) === waiters) {
-            this.affinityWaiters.delete(worker.id);
-          }
-          resolve(false);
-        }, timeoutMs),
-      };
       waiters.push(waiter);
     });
   }
 
   private dropAffinityWaiters(workerId: string): void {
-    const waiters = this.affinityWaiters.get(workerId);
-    if (!waiters) return;
-    this.affinityWaiters.delete(workerId);
-    for (const waiter of waiters) {
-      clearTimeout(waiter.timer);
-      waiter.resolve(false);
+    for (const waiter of [...(this.affinityWaiters.get(workerId) ?? [])]) {
+      waiter.settle(false);
     }
   }
 
-  private enqueueWaiter(timeoutMs: number): Promise<AcpWorker> {
+  private enqueueWaiter(timeoutMs: number, signal?: AbortSignal): Promise<AcpWorker> {
     return new Promise<AcpWorker>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        const idx = this.waitQueue.findIndex((w) => w.timer === timer);
+      let done = false;
+      const settle = (outcome: AcpWorker | Error) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        const idx = this.waitQueue.indexOf(waiter);
         if (idx !== -1) this.waitQueue.splice(idx, 1);
-        reject(
-          new PoolUnavailableError(
-            `Timed out waiting for an available ACP worker (${timeoutMs}ms)`
-          )
-        );
-      }, timeoutMs);
-
-      this.waitQueue.push({ resolve, reject, timer, since: Date.now() });
+        if (outcome instanceof Error) reject(outcome);
+        else resolve(outcome);
+      };
+      const onAbort = () =>
+        settle(new RequestAbortedError("The client went away while waiting for a worker"));
+      const timer = setTimeout(
+        () =>
+          settle(
+            new PoolUnavailableError(
+              `Timed out waiting for an available ACP worker (${timeoutMs}ms)`
+            )
+          ),
+        timeoutMs
+      );
+      const waiter: QueuedWaiter = { settle, since: Date.now() };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waitQueue.push(waiter);
     });
   }
 
   private rejectAllWaiters(err: Error): void {
-    const waiters = this.waitQueue;
-    this.waitQueue = [];
-    for (const waiter of waiters) {
-      clearTimeout(waiter.timer);
-      waiter.reject(err);
+    for (const waiter of [...this.waitQueue]) {
+      waiter.settle(err);
     }
   }
 

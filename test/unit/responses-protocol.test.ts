@@ -251,5 +251,26 @@ describe("ResponseStore", () => {
     store.save("huge", [user("y")]);
     store.save("d", [user("12345678")]);
     assert.equal(store.size(), 2);
+    assert.equal(store.bytes(), 9);
+  });
+
+  test("a previous_response_id chain is charged for each shared message once", () => {
+    const store = new ResponseStore(60_000, 100, 10);
+    const [m1, m2, m3] = [user("12345"), user("678"), user("90")];
+    store.save("a", [m1]);
+    store.save("b", [m1, m2]);
+    store.save("c", [m1, m2, m3]);
+    assert.equal(store.size(), 3);
+    assert.equal(store.bytes(), 10);
+
+    // Re-saving a head and dropping older ones keeps the shared messages charged once
+    store.save("c", [m1, m2, m3]);
+    assert.equal(store.bytes(), 10);
+    const tight = new ResponseStore(60_000, 2, 1_000);
+    tight.save("a", [m1]);
+    tight.save("b", [m1, m2]);
+    tight.save("c", [m1, m2, m3]);
+    assert.equal(tight.get("a"), undefined);
+    assert.equal(tight.bytes(), 10, "m1 is still held by b and c");
   });
 });

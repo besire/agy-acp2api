@@ -7,9 +7,11 @@ import {
   ResolvedModelTarget,
 } from "../compiler/model-resolver.js";
 import { ParserEvent, ToolCallStreamParser } from "../parser/stream-parser.js";
+import { PromptNotSentError } from "../pool/acp-worker.js";
 import {
   LeaseAcquisition,
   PoolUnavailableError,
+  RequestAbortedError,
   WorkerPool,
 } from "../pool/worker-pool.js";
 import { telemetryStore } from "../telemetry/metrics-store.js";
@@ -77,11 +79,12 @@ export class ChatService {
   /**
    * Leases a worker with a ready ACP session: the warm session whose history prefix matches
    * (only the new messages are sent), or a fresh one primed with the full transcript.
-   * Failures are `GatewayError`s; nothing needs releasing when this throws.
+   * Failures are `GatewayError`s; nothing needs releasing when this throws. `signal` is the
+   * client going away: waiting stops and no new session is opened for it.
    */
-  async prepare(req: ChatRequest, requestId: string): Promise<ChatTurn> {
+  async prepare(req: ChatRequest, requestId: string, signal?: AbortSignal): Promise<ChatTurn> {
     const target = resolveModelAndThinking(req, this.pool.getAvailableModels());
-    let lease = await this.acquire(target, req);
+    let lease = await this.acquire(target, req, signal);
     const reuse = lease.isReusedSession && lease.sessionId !== null;
     const images =
       lease.worker.agentInfo?.agentCapabilities?.promptCapabilities?.image === true;
@@ -92,11 +95,10 @@ export class ChatService {
     try {
       const pending = reuse ? lease.deltaMessages : req.messages;
       outgoing = images ? await resolveImages(pending) : pending;
+      if (signal?.aborted) throw new RequestAbortedError("The client went away");
     } catch (err) {
       this.pool.releaseUnusedLease(lease);
-      throw err instanceof GatewayError
-        ? err
-        : new GatewayError(errorMessage(err), 400, "invalid_request_error");
+      throw toGatewayError(err, 400, "invalid_request_error");
     }
 
     let sessionId = lease.sessionId;
@@ -114,7 +116,10 @@ export class ChatService {
         } catch {
           // If the worker had cached an unauthenticated state before login, recycle it and retry once
           this.pool.terminateWorker(lease.worker.id);
-          lease = { ...(await this.pool.acquireFresh(req.messages)), missReason: lease.missReason };
+          lease = {
+            ...(await this.pool.acquireFresh(req.messages, signal)),
+            missReason: lease.missReason,
+          };
           sessionId = await lease.worker.createSession(
             compiled.systemPromptAppend,
             target.acpModelId
@@ -143,17 +148,37 @@ export class ChatService {
 
   private async acquire(
     target: ResolvedModelTarget,
-    req: ChatRequest
+    req: ChatRequest,
+    signal?: AbortSignal
   ): Promise<LeaseAcquisition> {
     try {
       // `baseModelId` keeps session affinity across reasoning-effort changes
-      return await this.pool.acquireForRequest(target.baseModelId, req.tools, req.messages);
+      return await this.pool.acquireForRequest(
+        target.baseModelId,
+        req.tools,
+        req.messages,
+        signal
+      );
     } catch (err) {
-      throw err instanceof PoolUnavailableError
-        ? new GatewayError(errorMessage(err), 503, "service_unavailable")
-        : new GatewayError(errorMessage(err), 500, "server_error");
+      throw toGatewayError(err, 500, "server_error");
     }
   }
+}
+
+function toGatewayError(
+  err: unknown,
+  status: 400 | 500,
+  type: "invalid_request_error" | "server_error"
+): GatewayError {
+  if (err instanceof GatewayError) return err;
+  if (err instanceof PoolUnavailableError) {
+    return new GatewayError(errorMessage(err), 503, "service_unavailable");
+  }
+  if (err instanceof RequestAbortedError) {
+    // Nobody reads this response; the status only has to be an error
+    return new GatewayError(errorMessage(err), 503, "service_unavailable", "client_closed_request");
+  }
+  return new GatewayError(errorMessage(err), status, type);
 }
 
 /** A leased worker with a ready session. `run` must be called exactly once. */
@@ -222,7 +247,7 @@ export class ChatTurn {
 
     try {
       if (signal?.aborted) {
-        throw new Error("The client went away before the prompt was sent");
+        throw new PromptNotSentError("The client went away before the prompt was sent");
       }
       sent = true;
       const res = await worker.runPrompt(
@@ -273,7 +298,9 @@ export class ChatTurn {
         message,
         reasoning,
         finishReason: cutShort.signal.aborted
-          ? "stop"
+          ? toolCalls.length > 0
+            ? "tool_calls"
+            : "stop"
           : finishReasonFor(res.stopReason, toolCalls.length),
         usage: normalizeUsage(res.usage),
         actualModel: res.actualModelVersion || target.baseModelId,
@@ -283,13 +310,15 @@ export class ChatTurn {
       this.record(result, parser.parseFailures);
       return result;
     } catch (err) {
+      if (err instanceof PromptNotSentError) sent = false;
       this.record(null, parser.parseFailures, errorMessage(err));
       throw err;
     } finally {
-      if (!sent) {
-        // Nothing reached agy: a reused session is still good, a new one is only primed
+      if (!sent && this.lease.isReusedSession) {
+        // Nothing reached agy: the warm session is still good
         this.pool.releaseUnusedLease(this.lease);
       } else {
+        // Includes a new session that never got its prompt: nothing could ever match it
         if (!intact) this.pool.discardSession(worker.id, this.sessionId);
         this.pool.releaseWorker(worker);
       }

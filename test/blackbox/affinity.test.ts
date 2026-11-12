@@ -143,6 +143,43 @@ describe("session affinity", () => {
     });
   });
 
+  test("a streaming client that leaves while waiting sends nothing and keeps its session warm", async () => {
+    await withGateway({ env: { AGY_MAX_WORKERS: "1" } }, async (gw) => {
+      const u1 = { role: "user", content: "conversation A" };
+      const a1 = await turn(gw, [u1]);
+      const prompts = (text: RegExp) =>
+        gw.acpRequests("session/prompt").filter((m) => text.test(m.params.prompt[0].text)).length;
+      const sessionsOpened = () => gw.acpRequests("session/new").length;
+
+      const busy = turn(gw, [{ role: "user", content: "conversation B [[slow:800]]" }]);
+      await waitFor(() => prompts(/conversation B/) === 1, { what: "conversation B to start" });
+      const opened = sessionsOpened();
+
+      const streamAndLeave = async (messages: Msg[]) => {
+        const ac = new AbortController();
+        const pending = gw.fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gemini-3.8-flash", stream: true, messages }),
+          signal: ac.signal,
+        });
+        setTimeout(() => ac.abort(), 150);
+        await assert.rejects(pending);
+      };
+      // One waits for its session's worker, one queues for any worker; both leave
+      await streamAndLeave([u1, a1.reply, { role: "user", content: "abandoned follow-up" }]);
+      await streamAndLeave([{ role: "user", content: "abandoned new conversation" }]);
+      await busy;
+      await new Promise((r) => setTimeout(r, 200));
+
+      assert.equal(prompts(/abandoned/), 0, "no prompt went out for a client that had left");
+      assert.equal(sessionsOpened(), opened, "no session was opened for them either");
+      const a2 = await turn(gw, [u1, a1.reply, { role: "user", content: "real follow-up" }]);
+      assert.equal(a2.cache, "HIT");
+      assert.equal(a2.sessionId, a1.sessionId);
+    });
+  });
+
   test("gives up after the affinity wait and records why", async () => {
     await withGateway({ env: { AGY_MAX_WORKERS: "2", AGY2API_AFFINITY_WAIT_MS: "100" } }, async (gw) => {
       const u1 = { role: "user", content: "conversation A" };

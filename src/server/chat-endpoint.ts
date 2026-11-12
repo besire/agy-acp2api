@@ -35,9 +35,11 @@ export function chatEndpoint<S>(protocol: ChatProtocol<S>, service: ChatService)
     let turn: ChatTurn;
     const id = protocol.newResponseId();
     const created = Math.floor(Date.now() / 1000);
+    // Fires when the client disconnects, also while the request still waits for a worker
+    const clientGone = c.req.raw.signal;
     try {
       decoded = protocol.decodeRequest(body);
-      turn = await service.prepare(decoded.chat, id);
+      turn = await service.prepare(decoded.chat, id, clientGone);
     } catch (err) {
       return fail(c, toGatewayError(err));
     }
@@ -57,8 +59,11 @@ export function chatEndpoint<S>(protocol: ChatProtocol<S>, service: ChatService)
 
     if (req.stream) {
       return streamSSE(c, async (stream) => {
+        // `onAbort` only fires once a write fails; the request signal covers a client that left
+        // before the first write
         const abortController = new AbortController();
         stream.onAbort(() => abortController.abort());
+        const signal = AbortSignal.any([clientGone, abortController.signal]);
 
         const encoder = protocol.createStreamEncoder(ctx);
         // Events arrive from synchronous worker callbacks; writes are queued in order
@@ -72,7 +77,7 @@ export function chatEndpoint<S>(protocol: ChatProtocol<S>, service: ChatService)
         send(encoder.start());
         try {
           const result = completed(
-            await turn.run((event) => send(encoder.event(event)), abortController.signal)
+            await turn.run((event) => send(encoder.event(event)), signal)
           );
           await sendAndWait(encoder.finish(result));
         } catch (err) {
@@ -82,7 +87,7 @@ export function chatEndpoint<S>(protocol: ChatProtocol<S>, service: ChatService)
     }
 
     try {
-      const result = completed(await turn.run(() => {}, c.req.raw.signal));
+      const result = completed(await turn.run(() => {}, clientGone));
       c.header("X-Agy2Api-Actual-Model", result.actualModel);
       c.header("X-Agy2Api-TTFT-Ms", String(result.ttftMs));
       return c.json(protocol.encodeResponse(ctx, result) as object);

@@ -127,6 +127,8 @@ export class ToolCallStreamParser {
   public injectDirectToolCall(name: string, args: unknown): void {
     const argsStr =
       typeof args === "string" ? args : JSON.stringify(args ?? {});
+    // Like a parsed call, a native one ends the visible reply
+    this.hasSeenToolCall = true;
     this.emitParsedToolCall({ name, arguments: argsStr });
   }
 
